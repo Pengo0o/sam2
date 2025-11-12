@@ -21,6 +21,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr
+from peft import LoraConfig, get_peft_model
 
 from training.optimizer import construct_optimizer
 
@@ -164,6 +165,7 @@ class Trainer:
         optim_overrides: Optional[List[Dict[str, Any]]] = None,
         meters: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
+        lora_rank: Optional[int] = 8,
     ):
 
         self._setup_env_variables(env_variables)
@@ -182,6 +184,8 @@ class Trainer:
         distributed = DistributedConf(**distributed or {})
         cuda = CudaConf(**cuda or {})
         self.where = 0.0
+        self.lora_rank = lora_rank
+        self._pending_optimizer_state = None
 
         self._infer_distributed_backend_if_none(distributed, accelerator)
 
@@ -207,7 +211,6 @@ class Trainer:
 
         self._setup_components()  # Except Optimizer everything is setup here.
         self._move_to_device()
-        self._construct_optimizers()
         self._setup_dataloaders()
 
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
@@ -225,6 +228,29 @@ class Trainer:
             barrier()
 
         self.load_checkpoint()
+
+        if self.lora_rank is not None:
+            image_encoder = getattr(self.model, "image_encoder", None)
+            if image_encoder is None or not hasattr(image_encoder, "trunk"):
+                raise AttributeError(
+                    "LoRA injection requested, but model.image_encoder.trunk is missing."
+                )
+            lora_config = LoraConfig(
+                r=self.lora_rank,
+                lora_alpha=self.lora_rank,
+                use_rslora=False,
+                use_dora=False,
+                init_lora_weights="gaussian",
+                target_modules=["qkv", "proj"],
+                lora_dropout=0.1,
+            )
+            image_encoder.trunk = get_peft_model(image_encoder.trunk, lora_config)
+
+        self._construct_optimizers()
+        if self._pending_optimizer_state is not None:
+            self.optim.optimizer.load_state_dict(self._pending_optimizer_state)
+            self._pending_optimizer_state = None
+
         self._setup_ddp_distributed_training(distributed, accelerator)
         barrier()
 
@@ -430,7 +456,10 @@ class Trainer:
             ignore_missing_keys=self.checkpoint_conf.skip_saving_parameters,
         )
 
-        self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
+        if getattr(self, "optim", None) is not None:
+            self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
+        else:
+            self._pending_optimizer_state = checkpoint["optimizer"]
         self.loss.load_state_dict(checkpoint["loss"], strict=True)
         self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"]

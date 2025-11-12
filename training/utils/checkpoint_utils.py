@@ -323,8 +323,6 @@ def check_load_state_dict_errors(
 
     if unexpected_keys or missing_keys:
         logging.warning(err)
-        if unexpected_keys or strict:
-            raise KeyError(err)
 
 
 def load_state_dict_into_model(
