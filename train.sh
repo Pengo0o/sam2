@@ -1,0 +1,5 @@
+# 1112 lora_tune
+python training/train.py \
+    -c configs/sam2.1_training/sam2.1_hiera_l_hels_finetune+lora.yaml \
+    --use-cluster 0 \
+    --num-gpus 2
