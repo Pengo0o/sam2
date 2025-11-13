@@ -24,6 +24,7 @@ from training.dataset.vos_segment_loader import (
     MultiplePNGSegmentLoader,
     PalettisedPNGSegmentLoader,
     SA1BSegmentLoader,
+    SingleImagePNGSegmentLoader,
 )
 
 
@@ -145,6 +146,77 @@ class PNGRawDataset(VOSRawDataset):
         return len(self.video_names)
 
 
+class BoneRawDataset(VOSRawDataset):
+    def __init__(
+        self,
+        img_folder,
+        gt_folder,
+        file_list_txt=None,
+        excluded_videos_list_txt=None,
+        num_frames=1,
+        mask_area_frac_thresh=1.1,  # no filtering by default
+        uncertain_iou=-1,  # no filtering by default
+    ):
+        self.img_folder = img_folder
+        self.gt_folder = gt_folder
+        self.num_frames = num_frames
+        self.mask_area_frac_thresh = mask_area_frac_thresh
+        self.uncertain_iou = uncertain_iou  # stability score
+
+        # Read the subset defined in file_list_txt
+        if file_list_txt is not None:
+            with g_pathmgr.open(file_list_txt, "r") as f:
+                subset = [os.path.splitext(line.strip())[0] for line in f]
+        else:
+            subset = os.listdir(self.img_folder)
+            subset = [
+                path.split(".")[0] for path in subset if path.endswith(".png")
+            ]  # remove extension
+
+        # Read and process excluded files if provided
+        if excluded_videos_list_txt is not None:
+            with g_pathmgr.open(excluded_videos_list_txt, "r") as f:
+                excluded_files = [os.path.splitext(line.strip())[0] for line in f]
+        else:
+            excluded_files = []
+
+        # Check if it's not in excluded_files and it exists
+        self.video_names = [
+            video_name for video_name in subset if video_name not in excluded_files
+        ]
+
+    def get_video(self, idx):
+        """
+        Given a VOSVideo object, return the mask tensors.
+        """
+        video_name = self.video_names[idx]
+
+        video_frame_path = os.path.join(self.img_folder, video_name + ".png")
+        mask_path = None
+        for ext in [".png"]:
+            candidate = os.path.join(self.gt_folder, video_name + ext)
+            if os.path.exists(candidate):
+                mask_path = candidate
+                break
+        if mask_path is None:
+            raise FileNotFoundError(
+                f"Mask file for {video_name} not found under {self.gt_folder}"
+            )
+
+        segment_loader = SingleImagePNGSegmentLoader(mask_path)
+
+        frames = []
+        for frame_idx in range(self.num_frames):
+            frames.append(VOSFrame(frame_idx, image_path=video_frame_path))
+        video_name = video_name.split("_")[-1]  # filename is sa_{int}
+        # video id needs to be image_id to be able to load correct annotation file during eval
+        video = VOSVideo(video_name, int(video_name), frames)
+        return video, segment_loader
+
+    def __len__(self):
+        return len(self.video_names)
+
+
 class SA1BRawDataset(VOSRawDataset):
     def __init__(
         self,
@@ -210,7 +282,6 @@ class SA1BRawDataset(VOSRawDataset):
 
     def __len__(self):
         return len(self.video_names)
-
 
 class JSONRawDataset(VOSRawDataset):
     """

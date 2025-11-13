@@ -228,6 +228,37 @@ class MultiplePNGSegmentLoader:
         return
 
 
+class SingleImagePNGSegmentLoader:
+    """
+    SegmentLoader for datasets where each sample has a single mask image (e.g. PNG)
+    that encodes object ids using pixel values.
+    """
+
+    def __init__(self, mask_path, background_value: int = 0):
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"Mask file {mask_path} not found.")
+        mask = np.array(PILImage.open(mask_path))
+        if mask.ndim == 3:
+            # convert RGB to single channel
+            mask = mask[:, :, 0]
+
+        unique_ids = np.unique(mask)
+        unique_ids = [int(i) for i in unique_ids if i != background_value]
+        self.segments = {}
+        mask_tensor = torch.from_numpy(mask)
+        for obj_id in unique_ids:
+            binary = (mask_tensor == obj_id)
+            self.segments[obj_id] = binary
+
+        if not self.segments:
+            # fallback to a zero mask to avoid downstream crashes
+            self.segments[1] = torch.zeros_like(mask_tensor, dtype=torch.bool)
+
+    def load(self, frame_id):
+        # return clones so downstream augmentations can modify in-place
+        return {obj_id: seg.clone() for obj_id, seg in self.segments.items()}
+
+
 class LazySegments:
     """
     Only decodes segments that are actually used.

@@ -183,6 +183,26 @@ class RandomResizeAPI:
         return datapoint
 
 
+class ResizeAPI:
+    def __init__(self, size, max_size=None, square=False, v2=False):
+        self.size = size
+        self.max_size = max_size
+        self.square = square
+        self.v2 = v2
+
+    def __call__(self, datapoint, **kwargs):
+        for i in range(len(datapoint.frames)):
+            datapoint = resize(
+                datapoint,
+                i,
+                self.size,
+                self.max_size,
+                square=self.square,
+                v2=self.v2,
+            )
+        return datapoint
+
+
 class ToTensorAPI:
     def __init__(self, v2=False):
         self.v2 = v2
