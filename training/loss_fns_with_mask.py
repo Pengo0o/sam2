@@ -6,7 +6,11 @@
 
 from collections import defaultdict
 from typing import Dict, List
+import os
+import logging
 
+import cv2
+import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -273,13 +277,20 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
         # accumulate the loss over prediction steps
         losses = {"loss_mask": 0, "loss_dice": 0, "loss_iou": 0, "loss_class": 0}
+        loss_weight_masks = []  # Store loss weight masks for visualization
         for src_masks, ious, object_score_logits in zip(
             src_masks_list, ious_list, object_score_logits_list
         ):
-            self._update_losses(
+            loss_weight_mask = self._update_losses(
                 losses, src_masks, target_masks, ious, num_objects, object_score_logits
             )
+            loss_weight_masks.append(loss_weight_mask)
+
         losses[CORE_LOSS_KEY] = self.reduce_loss(losses)
+
+        # Store loss_weight_masks in outputs for visualization
+        outputs["loss_weight_masks"] = loss_weight_masks
+
         return losses
 
     def _update_losses(
@@ -375,6 +386,9 @@ class MultiStepMultiMasksAndIous(nn.Module):
         losses["loss_dice"] += loss_dice.sum()
         losses["loss_iou"] += loss_iou.sum()
         losses["loss_class"] += loss_class
+
+        # Return loss_weight_mask for visualization
+        return loss_weight_mask
 
     def reduce_loss(self, losses):
         reduced_loss = 0.0

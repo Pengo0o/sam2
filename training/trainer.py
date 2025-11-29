@@ -14,6 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
+import cv2
 import numpy as np
 
 import torch
@@ -503,6 +504,8 @@ class Trainer:
                 loss, loss_log_str, self.steps[phase]
             )
 
+        self._maybe_visualize_loss_masks(batch, outputs, phase)
+
         if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
             self.logger.log(
                 loss_log_str,
@@ -524,6 +527,144 @@ class Trainer:
                     )
 
         return ret_tuple
+
+    def _maybe_visualize_loss_masks(
+        self, batch: BatchedVideoDatapoint, outputs: List[Dict[str, Any]], phase: str
+    ) -> None:
+        """
+        Save visualizations of the loss edge masks at a configurable interval.
+        """
+        viz_freq = getattr(self.logging_conf, "log_visual_frequency", 0) or 0
+        if viz_freq <= 0:
+            return
+        # Only the primary rank should write visualizations
+        if self.distributed_rank != 0:
+            return
+        current_step = self.steps[phase]
+        if current_step % viz_freq != 0:
+            return
+        if not outputs or not isinstance(outputs, list):
+            return
+        frame_pred = outputs[0]
+        loss_weight_masks = frame_pred.get("loss_weight_masks")
+        if not loss_weight_masks:
+            return
+        loss_weight_mask = loss_weight_masks[-1]
+        if loss_weight_mask is None or loss_weight_mask.numel() == 0:
+            return
+        try:
+            # Prepare tensors
+            loss_weight_tensor = loss_weight_mask[0, 0].detach()
+            pred_masks_high_res = frame_pred.get("pred_masks_high_res")
+            if pred_masks_high_res is None:
+                return
+            pred_mask = pred_masks_high_res[0, 0].detach()
+            gt_masks = batch.masks[0][0].detach().float()
+            img = batch.flat_img_batch[0].detach()
+
+            mean = img.new_tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std = img.new_tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            img_denorm = torch.clamp((img * std + mean) * 255, 0, 255)
+            img_np = img_denorm.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            img_bgr = cv2.cvtColor(np.ascontiguousarray(img_np), cv2.COLOR_RGB2BGR)
+
+            pred_mask_np = (torch.sigmoid(pred_mask) > 0.5).float()
+            pred_mask_np = (pred_mask_np * 255).cpu().numpy().astype(np.uint8)
+            gt_mask_np = (gt_masks * 255).cpu().numpy().astype(np.uint8)
+
+            pred_overlay = cv2.addWeighted(
+                img_bgr,
+                0.6,
+                cv2.applyColorMap(pred_mask_np, cv2.COLORMAP_JET),
+                0.4,
+                0,
+            )
+            gt_overlay = cv2.addWeighted(
+                img_bgr,
+                0.6,
+                cv2.applyColorMap(gt_mask_np, cv2.COLORMAP_JET),
+                0.4,
+                0,
+            )
+
+            # Extract edge mask (boundary region where loss is ignored)
+            edge_mask_binary = (
+                torch.clamp(1.0 - loss_weight_tensor, 0.0, 1.0)
+            ).cpu().numpy()
+
+            # Define purple color in BGR format
+            purple_color = np.array([0, 255, 0], dtype=np.uint8)  # Purple in BGR
+
+            # Create images with only purple boundary overlay
+            img_with_edge = img_bgr.copy()
+            pred_with_edge = pred_overlay.copy()
+            gt_with_edge = gt_overlay.copy()
+
+            # Apply purple color only at boundary regions
+            # edge_mask_binary is [H, W], expand to [H, W, 3] for broadcasting
+            edge_mask_3ch = edge_mask_binary[:, :, np.newaxis]
+
+            # Blend purple color only where edge exists (alpha blending)
+            alpha = 0.5  # Transparency for purple overlay
+            img_with_edge = (img_with_edge * (1 - alpha * edge_mask_3ch) +
+                            purple_color * alpha * edge_mask_3ch).astype(np.uint8)
+            pred_with_edge = (pred_with_edge * (1 - alpha * edge_mask_3ch) +
+                             purple_color * alpha * edge_mask_3ch).astype(np.uint8)
+            gt_with_edge = (gt_with_edge * (1 - alpha * edge_mask_3ch) +
+                           purple_color * alpha * edge_mask_3ch).astype(np.uint8)
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.7
+            thickness = 2
+            cv2.putText(
+                img_with_edge,
+                "Image + Edge",
+                (10, 30),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+            )
+            cv2.putText(
+                pred_with_edge,
+                "Pred + Edge ",
+                (10, 30),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+            )
+            cv2.putText(
+                gt_with_edge,
+                "GT + Edge ",
+                (10, 30),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+            )
+
+            combined_loss_vis = np.concatenate(
+                [img_with_edge, pred_with_edge, gt_with_edge], axis=1
+            )
+
+            if not hasattr(self, "_loss_mask_vis_dir"):
+                root_log_dir = os.path.dirname(os.path.abspath(self.logging_conf.log_dir))
+                model_viz_dir = getattr(
+                    unwrap_ddp_if_wrapped(self.model), "visualize_dir", None
+                )
+                base_dir = model_viz_dir or os.path.join(root_log_dir, "visualizations")
+                self._loss_mask_vis_dir = os.path.join(
+                    base_dir, "visualizations_loss_masks"
+                )
+            os.makedirs(self._loss_mask_vis_dir, exist_ok=True)
+            save_path = os.path.join(
+                self._loss_mask_vis_dir, f"{phase}_iter_{current_step:06d}_loss_mask.jpg"
+            )
+            cv2.imwrite(save_path, combined_loss_vis)
+            logging.info("Loss mask visualization saved to %s", save_path)
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.warning("Loss mask visualization failed: %s", exc)
 
     def run(self):
         assert self.mode in ["train", "train_only", "val"]
