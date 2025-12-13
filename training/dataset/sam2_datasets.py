@@ -77,6 +77,7 @@ class TorchTrainMixedDataset:
         pin_memory: bool,
         drop_last: bool,
         collate_fn: Optional[Callable] = None,
+        collate_fns: Optional[List[Callable]] = None,
         worker_init_fn: Optional[Callable] = None,
         phases_per_epoch: int = 1,
         dataset_prob: Optional[List[float]] = None,
@@ -89,7 +90,8 @@ class TorchTrainMixedDataset:
             shuffle (bool): Whether or not to shuffle data.
             pin_memory (bool): If True, use pinned memory when loading tensors from disk.
             drop_last (bool): Whether or not to drop the last batch of data.
-            collate_fn (Callable): Function to merge a list of samples into a mini-batch.
+            collate_fn (Callable): Function to merge a list of samples into a mini-batch. (deprecated, use collate_fns)
+            collate_fns (List[Callable]): List of collate functions for each dataset. If None, uses collate_fn for all.
             worker_init_fn (Callable): Function to init each dataloader worker.
             phases_per_epoch (int): Number of phases per epoch.
             dataset_prob (List[float]): Probability of choosing the dataloader to sample from. Should sum to 1.0
@@ -101,7 +103,18 @@ class TorchTrainMixedDataset:
         self.shuffle = shuffle
         self.pin_memory = pin_memory
         self.drop_last = drop_last
-        self.collate_fn = collate_fn
+        # self.collate_fn = collate_fn
+
+        # Handle collate_fns: support both single collate_fn and list of collate_fns
+        if collate_fns is not None:
+            assert len(collate_fns) == len(datasets), "collate_fns must have same length as datasets"
+            self.collate_fns = collate_fns
+        elif collate_fn is not None:
+            # Backward compatibility: if only collate_fn is provided, use it for all datasets
+            self.collate_fns = [collate_fn] * len(datasets)
+        else:
+            self.collate_fns = [None] * len(datasets)
+
         self.worker_init_fn = worker_init_fn
         assert len(self.datasets) > 0
         for dataset in self.datasets:
@@ -173,7 +186,8 @@ class TorchTrainMixedDataset:
                     num_workers=self.num_workers,
                     pin_memory=self.pin_memory,
                     batch_sampler=batch_sampler,
-                    collate_fn=self.collate_fn,
+                    collate_fn=self.collate_fns[d_idx],
+                    # collate_fn=self.collate_fn,
                     worker_init_fn=self.worker_init_fn,
                 )
             )

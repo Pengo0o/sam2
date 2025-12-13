@@ -158,7 +158,7 @@ class SAM2ClickerAdapter:
         max_clicks: int = 20,
         target_iou: float = 0.90,
         multimask_output: bool = True
-    ) -> Tuple[List[float], np.ndarray, List[dict]]:
+    ) -> Tuple[List[float], np.ndarray, List[dict], np.ndarray, int]:
         """
         执行迭代式预测（完整的SimpleClick评估流程）
 
@@ -173,6 +173,8 @@ class SAM2ClickerAdapter:
             ious_list: 每次迭代的IoU列表
             final_mask: 最终预测的mask
             clicks_history: 点击历史记录
+            best_mask: IoU最高的预测mask
+            best_click_idx: 达到最高IoU时的点击次数
         """
         # 1. 设置图像和GT
         self.predictor.set_image(image)
@@ -182,6 +184,11 @@ class SAM2ClickerAdapter:
         pred_mask = np.zeros_like(gt_mask, dtype=bool)
         ious_list = []
         prev_logits = None
+
+        # 跟踪最佳结果
+        best_iou = 0.0
+        best_mask = None
+        best_click_idx = 0
 
         # 2. 迭代预测
         for click_idx in range(max_clicks):
@@ -216,15 +223,21 @@ class SAM2ClickerAdapter:
             iou = self._compute_iou(gt_mask, pred_mask)
             ious_list.append(iou)
 
+            # 2.6 更新最佳结果
+            if iou > best_iou:
+                best_iou = iou
+                best_mask = pred_mask.copy()
+                best_click_idx = click_idx + 1
+
             print(f"Click {click_idx + 1}: IoU = {iou:.4f}, "
                   f"{'Positive' if is_positive else 'Negative'} @ {coords}")
 
-            # 2.6 检查是否达到目标
+            # 2.7 检查是否达到目标
             if iou >= target_iou:
                 print(f"Reached target IoU {target_iou:.2f} in {click_idx + 1} clicks!")
                 break
 
-        return ious_list, pred_mask, self.clicks_list
+        return ious_list, pred_mask, self.clicks_list, best_mask, best_click_idx
 
     @staticmethod
     def _compute_iou(gt_mask: np.ndarray, pred_mask: np.ndarray) -> float:
