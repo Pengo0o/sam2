@@ -15,6 +15,8 @@ import torch
 import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.ndimage import binary_opening, distance_transform_edt
+from skimage.measure import label
 
 from training.trainer import CORE_LOSS_KEY
 
@@ -53,6 +55,89 @@ def extract_edge_mask(masks, edge_width=3):
     edge_mask = (dilated - eroded) > 0
 
     return edge_mask.float()
+
+
+def unet_weight_map(y, wc=None, w0=10, sigma=5):
+    """
+    Generate weight maps for background regions only.
+    Foreground regions get weight 1.0, background regions get calculated weights.
+
+    Args:
+        y: Binary mask (numpy array) of shape [H, W]
+        wc: Class weights dictionary (optional)
+        w0: Weight parameter for boundary regions
+        sigma: Sigma parameter for Gaussian weighting
+
+    Returns:
+        Weight map of shape [H, W]
+    """
+    y_separated = binary_opening(y, iterations=2)
+
+    labels = label(y_separated)
+
+    no_labels = labels == 0
+    label_ids = sorted(np.unique(labels))[1:]
+
+    # Initialize weight map with 1.0 for all pixels
+    w = np.ones_like(y, dtype=np.float64)
+
+    # Only calculate weights for background regions
+    if len(label_ids) > 1:
+        distances = np.zeros((y.shape[0], y.shape[1], len(label_ids)))
+
+        for i, label_id in enumerate(label_ids):
+            # 计算到特定标签边界的距离
+            distances[:, :, i] = distance_transform_edt(labels != label_id)
+
+        distances = np.sort(distances, axis=2)
+        d1 = distances[:, :, 0]
+        d2 = distances[:, :, 1]
+        boundary_weight = w0 * np.exp(-1/2*((d1 + d2) / sigma)**2) * no_labels
+
+        # Apply boundary weight only to background regions
+        w[no_labels] = 1.0 + boundary_weight[no_labels]
+
+    # Apply class weights only to background if provided
+    if wc and 0 in wc:
+        w[y == 0] = w[y == 0] * wc[0]
+
+    return w
+
+
+def extract_small_area_mask(masks, w0=10, sigma=5):
+    """
+    Extract foreground regions from ground truth masks using unet_weight_map.
+
+    Args:
+        masks: Binary masks of shape [N, C, H, W] (PyTorch tensor)
+        w0: Weight parameter for boundary regions
+        sigma: Sigma parameter for Gaussian weighting
+
+    Returns:
+        Foreground mask of same shape, where 1=foreground region, 0=background
+    """
+    device = masks.device
+    dtype = masks.dtype
+    N, C, H, W = masks.shape
+
+    small_area_masks = torch.zeros_like(masks)
+
+    # Process each sample in the batch
+    for n in range(N):
+        for c in range(C):
+            # Convert to numpy
+            mask_np = masks[n, c].cpu().numpy()
+
+            # Apply unet_weight_map to get weight map
+            weight_map = unet_weight_map(mask_np, wc=None, w0=w0, sigma=sigma)
+
+            # Extract foreground regions (where mask > 0)
+            small_area = (weight_map > 0).astype(np.float32)
+
+            # Convert back to torch tensor
+            small_area_masks[n, c] = torch.from_numpy(small_area).to(device=device, dtype=dtype)
+
+    return small_area_masks
 
 
 def dice_loss(inputs, targets, num_objects, loss_on_multimask=False, loss_weight_mask=None):
@@ -201,8 +286,9 @@ class MultiStepMultiMasksAndIous(nn.Module):
         focal_alpha_obj_score=-1,
         ignore_edge_loss=False,
         edge_width=3,
-        focal_edge_weight=None,
-        dice_edge_weight=None,
+        focal_edge_weight = None,
+        focal_edge_smallarea_weight=None, # add small area penalty
+        dice_edge_weight=0, # ignore the propagation
     ):
         """
         This class computes the multi-step multi-mask and IoU losses.
@@ -254,6 +340,8 @@ class MultiStepMultiMasksAndIous(nn.Module):
         else:
             self.focal_edge_weight = focal_edge_weight
             self.dice_edge_weight = dice_edge_weight
+        
+        self.focal_edge_smallarea_weight = focal_edge_smallarea_weight
 
     def forward(self, outs_batch: List[Dict], targets_batch: torch.Tensor):
         assert len(outs_batch) == len(targets_batch)
@@ -317,24 +405,38 @@ class MultiStepMultiMasksAndIous(nn.Module):
         self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
     ):
         """
-        Compute and update losses with optional edge weighting.
+        Compute and update losses with optional edge weighting and foreground weighting.
+        Strategy:
+        1. Edge regions get weight from focal_edge_weight (typically 0)
+        2. Non-edge foreground regions get weight 3
+        3. Other regions get weight 1
         """
         # Create weight masks for focal and dice losses based on edge_weight parameters
         focal_weight_mask = None
         dice_weight_mask = None
 
-        if self.focal_edge_weight is not None or self.dice_edge_weight is not None:
+        if self.focal_edge_weight is not None or self.dice_edge_weight is not None or self.focal_edge_smallarea_weight is not None:
             # Extract edge mask from target masks
             edge_mask = extract_edge_mask(target_masks, edge_width=self.edge_width)
 
+            # Extract foreground mask from target masks
+            small_area = extract_small_area_mask(target_masks)
+
             # Create focal loss weight mask
             if self.focal_edge_weight is not None:
-                # Non-edge regions: weight = 1.0
-                # Edge regions: weight = focal_edge_weight (e.g., 0.0, 2.0, etc.)
+                # Initialize with weight = 1.0
                 focal_weight_mask = torch.ones_like(target_masks)
+
+                # Apply edge weight to edge regions (overrides foreground weight)
                 focal_weight_mask = torch.where(
                     edge_mask > 0,
                     torch.full_like(edge_mask, self.focal_edge_weight),
+                    focal_weight_mask
+                )
+
+                focal_weight_mask = torch.where(
+                    (small_area > 0),
+                    torch.full_like(target_masks, self.focal_edge_smallarea_weight),
                     focal_weight_mask
                 )
 

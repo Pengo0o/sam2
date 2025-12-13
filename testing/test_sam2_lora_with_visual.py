@@ -176,7 +176,8 @@ def get_image_mask_pairs(args):
 
 def visualize_result(image, gt_mask, pred_mask, clicks_list, iou, save_path):
     """Visualize prediction result"""
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    # Simplified to 3 subplots, removing error map
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
     # 1. Original image with clicks
     axes[0].imshow(image)
@@ -191,26 +192,15 @@ def visualize_result(image, gt_mask, pred_mask, clicks_list, iou, save_path):
 
     # 2. Ground truth
     axes[1].imshow(image)
-    axes[1].imshow(gt_mask, alpha=0.5, cmap='jet')
+    axes[1].imshow(gt_mask, alpha=0.5, cmap='jet', interpolation='nearest')
     axes[1].set_title('Ground Truth', fontsize=12)
     axes[1].axis('off')
 
     # 3. Prediction
     axes[2].imshow(image)
-    axes[2].imshow(pred_mask, alpha=0.5, cmap='jet')
+    axes[2].imshow(pred_mask, alpha=0.5, cmap='jet', interpolation='nearest')
     axes[2].set_title(f'Prediction (IoU={iou:.4f})', fontsize=12)
     axes[2].axis('off')
-
-    # 4. Error map
-    fn_mask = np.logical_and(gt_mask, np.logical_not(pred_mask))
-    fp_mask = np.logical_and(np.logical_not(gt_mask), pred_mask)
-    error_map = np.zeros((*gt_mask.shape, 3))
-    error_map[fn_mask] = [1, 0, 0]  # False Negative: Red
-    error_map[fp_mask] = [0, 0, 1]  # False Positive: Blue
-    axes[3].imshow(image)
-    axes[3].imshow(error_map, alpha=0.5)
-    axes[3].set_title(f'Error Map (Red=FN, Blue=FP)', fontsize=12)
-    axes[3].axis('off')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -218,23 +208,45 @@ def visualize_result(image, gt_mask, pred_mask, clicks_list, iou, save_path):
 
 
 def save_best_mask_overlay(image, best_mask, best_iou, best_click_idx, save_path):
-    """Save best prediction mask overlayed on original image"""
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    """Save best prediction mask overlayed on original image using OpenCV"""
+    # Ensure image is in the correct format
+    if image.dtype != np.uint8:
+        image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
 
-    # Display original image
-    ax.imshow(image)
+    # Convert RGB to BGR for OpenCV
+    img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-    # Overlay best mask with transparency
-    ax.imshow(best_mask, alpha=0.5, cmap='jet')
+    # Convert mask to uint8 [0, 255]
+    if best_mask.dtype == bool or best_mask.max() <= 1.0:
+        mask_np = (best_mask * 255).astype(np.uint8)
+    else:
+        mask_np = best_mask.astype(np.uint8)
 
-    # Add title with best IoU and click info
-    ax.set_title(f'Best Prediction: IoU={best_iou:.4f} at Click {best_click_idx}',
-                 fontsize=14, fontweight='bold')
-    ax.axis('off')
+    # Apply JET colormap to mask
+    mask_colored = cv2.applyColorMap(mask_np, cv2.COLORMAP_JET)
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    # Create overlay by blending image and colored mask
+    overlay = cv2.addWeighted(img_bgr, 0.5, mask_colored, 0.5, 0)
+
+    # Add title text with smaller, clearer font
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.4
+    thickness = 1
+    text = f'Best Prediction: IoU={best_iou:.4f} at Click {best_click_idx}'
+
+    # Get text size to create a background box
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+    # Add black background for text for better visibility
+    cv2.rectangle(overlay, (10, 10), (text_width + 20, text_height + baseline + 20),
+                  (0, 0, 0), -1)
+
+    # Add white text
+    cv2.putText(overlay, text, (15, text_height + 15), font, font_scale,
+                (255, 255, 255), thickness, cv2.LINE_AA)
+
+    # Save image with high quality
+    cv2.imwrite(str(save_path), overlay, [cv2.IMWRITE_PNG_COMPRESSION, 3])
 
 
 def compute_noc_metric(all_ious, iou_thrs=[0.80, 0.85, 0.90], max_clicks=25):

@@ -700,43 +700,14 @@ class SAM2Train(SAM2Base):
 
             combined_image = np.concatenate([img_bgr, pred_overlay, gt_overlay], axis=1)
 
+            # Determine phase based on model training mode
+            phase = "train" if self.training else "val"
+
             os.makedirs(os.path.join(self.visualize_dir, "visualization_images_with_prompt"), exist_ok=True)
-            save_path = os.path.join(self.visualize_dir, "visualization_images_with_prompt",f'iter_{self.iter_count:06d}_basic.jpg')
+            save_path = os.path.join(self.visualize_dir, "visualization_images_with_prompt", f'{phase}_iter_{self.iter_count:06d}_basic.jpg')
             cv2.imwrite(save_path, combined_image)
             logging.info(f"Basic visualization saved to {save_path}")
-
-            # Loss weight mask visualization
-            print('loss_weight_masks' in pred[frame_idx])
-            if 'loss_weight_masks' in pred[frame_idx]:
-                loss_weight_masks = pred[frame_idx]['loss_weight_masks']
-                if loss_weight_masks and loss_weight_masks[0] is not None:
-                    loss_weight_mask = loss_weight_masks[-1][0, 0]
-                    loss_weight_mask_np = (loss_weight_mask * 255).cpu().numpy().astype(np.uint8)
-                    edge_mask_np = ((1.0 - loss_weight_mask) * 255).cpu().numpy().astype(np.uint8)
-
-                    loss_weight_colored = cv2.applyColorMap(loss_weight_mask_np, cv2.COLORMAP_VIRIDIS)
-                    edge_colored = cv2.applyColorMap(edge_mask_np, cv2.COLORMAP_HOT)
-                    img_with_loss_weight = cv2.addWeighted(img_bgr, 0.6, loss_weight_colored, 0.4, 0)
-                    img_with_edge = cv2.addWeighted(img_bgr, 0.6, edge_colored, 0.4, 0)
-                    pred_with_loss_weight = cv2.addWeighted(pred_overlay.copy(), 0.6, loss_weight_colored, 0.4, 0)
-
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.7
-                    thickness = 2
-                    cv2.putText(loss_weight_colored, 'Loss Weight Mask', (10, 30), font, font_scale, (255, 255, 255), thickness)
-                    cv2.putText(edge_colored, 'Edge Region (No Grad)', (10, 30), font, font_scale, (255, 255, 255), thickness)
-                    cv2.putText(img_with_loss_weight, 'Image + Loss Mask', (10, 30), font, font_scale, (255, 255, 255), thickness)
-                    cv2.putText(img_with_edge, 'Image + Edge Mask', (10, 30), font, font_scale, (255, 255, 255), thickness)
-                    cv2.putText(pred_with_loss_weight, 'Pred + Loss Mask', (10, 30), font, font_scale, (255, 255, 255), thickness)
-
-                    row1 = np.concatenate([loss_weight_colored, edge_colored, img_with_loss_weight], axis=1)
-                    row2 = np.concatenate([img_with_edge, pred_with_loss_weight, gt_overlay], axis=1)
-                    combined_loss_vis = np.concatenate([row1, row2], axis=0)
-
-                    os.makedirs(os.path.join(self.visualize_dir, "visualizations_loss_masks"), exist_ok=True)
-                    save_path_loss = os.path.join(self.visualize_dir, "visualizations_loss_masks",f'iter_{self.iter_count:06d}_loss_mask.jpg')
-                    cv2.imwrite(save_path_loss, combined_loss_vis)
-                    logging.info(f"Loss mask visualization saved to {save_path_loss}")
+            
 
         except Exception as e:
             logging.warning(f"Visualization failed: {e}")

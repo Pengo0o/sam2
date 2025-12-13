@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument('--config', type=str, default='configs/sam2.1/sam2.1_hiera_l.yaml',
                         help='Path to SAM2 config file')
     parser.add_argument('--checkpoint', type=str,
-                        default='output_1112_sam2.1_hiera_l_hels_finetune+lora/checkpoints/checkpoint_400.pt',
+                        default="output_1129_sam2.1_hiera_l_hels_finetune+lora+new_loss_with_mask+dis5k+boundary_weight/checkpoints/checkpoint_210.pt",
                         help='Path to model checkpoint')
     parser.add_argument('--device', type=str, default='cuda:0',
                         help='Device to run on')
@@ -265,7 +265,7 @@ def plot_clicks_vs_iou(clicks, mean_ious, std_ious, output_path):
                      mean_ious + std_ious,
                      alpha=0.2,
                      color='blue',
-                     label='± 1 std')
+                     label='ï¿½ 1 std')
 
     # Styling
     plt.xlabel('Number of Clicks', fontsize=14)
@@ -280,7 +280,7 @@ def plot_clicks_vs_iou(clicks, mean_ious, std_ious, output_path):
     # Add text box with final statistics
     final_miou = mean_ious[-1]
     final_std = std_ious[-1]
-    textstr = f'Final mIoU@{len(clicks)}: {final_miou:.4f} ± {final_std:.4f}'
+    textstr = f'Final mIoU@{len(clicks)}: {final_miou:.4f} ï¿½ {final_std:.4f}'
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
     plt.text(0.05, 0.95, textstr, transform=plt.gca().transAxes, fontsize=12,
              verticalalignment='top', bbox=props)

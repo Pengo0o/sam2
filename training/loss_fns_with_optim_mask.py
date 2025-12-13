@@ -24,15 +24,16 @@ from training.utils.distributed import get_world_size, is_dist_avail_and_initial
 def extract_edge_mask(masks, edge_width=3):
     """
     Extract edge/boundary mask from ground truth masks.
+    Prevents edge overlap in narrow concave regions (e.g., C-shape, U-shape).
     Args:
-        masks: Binary masks of shape [N, C, H, W]
+        masks: Binary masks of shape [N, 1, H, W]
         edge_width: Width of the edge region in pixels
     Returns:
-        Edge mask of same shape, where 1=edge region, 0=non-edge region
+        edge_mask: Edge mask of same shape, where 1=edge region, 0=non-edge region
+        narrow_channels: Narrow channel mask for applying high weights
     """
     import torch.nn.functional as F
 
-    # Use max pooling (dilation) to expand the mask
     kernel_size = 2 * edge_width + 1
     dilated = F.max_pool2d(
         masks,
@@ -41,7 +42,6 @@ def extract_edge_mask(masks, edge_width=3):
         padding=edge_width
     )
 
-    # Use -max_pool on inverted mask (equivalent to erosion)
     eroded = -F.max_pool2d(
         -masks,
         kernel_size=kernel_size,
@@ -49,10 +49,23 @@ def extract_edge_mask(masks, edge_width=3):
         padding=edge_width
     )
 
-    # Edge is the difference between dilated and eroded
     edge_mask = (dilated - eroded) > 0
 
-    return edge_mask.float()
+    # Detect narrow channels in background to prevent edge overlap
+    background = 1 - masks
+    background_eroded = -F.max_pool2d(
+        -background,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=edge_width
+    )
+    # Narrow channels: background regions that disappear after erosion
+    narrow_channels = (background - background_eroded) > 0
+
+    # Remove edge mask in narrow channel regions
+    edge_mask = edge_mask * (1 - narrow_channels.float())
+
+    return edge_mask.float(), narrow_channels.float()
 
 
 def dice_loss(inputs, targets, num_objects, loss_on_multimask=False, loss_weight_mask=None):
@@ -203,6 +216,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         edge_width=3,
         focal_edge_weight=None,
         dice_edge_weight=None,
+        narrow_channel_weight=3.0,
     ):
         """
         This class computes the multi-step multi-mask and IoU losses.
@@ -227,6 +241,8 @@ class MultiStepMultiMasksAndIous(nn.Module):
                             - 0.0: ignore edges (no gradient on edges)
                             - 2.0: emphasize edges (2x weight on edges)
                             - any float: custom edge weight
+            narrow_channel_weight: weight multiplier for narrow channel regions (default: 3.0)
+                                 - Higher values give more importance to narrow concave regions
         """
 
         super().__init__()
@@ -245,6 +261,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         self.iou_use_l1_loss = iou_use_l1_loss
         self.pred_obj_scores = pred_obj_scores
         self.edge_width = edge_width
+        self.narrow_channel_weight = narrow_channel_weight
 
         # Handle edge weight parameters
         if ignore_edge_loss:
@@ -319,35 +336,51 @@ class MultiStepMultiMasksAndIous(nn.Module):
         """
         Compute and update losses with optional edge weighting.
         """
-        # Create weight masks for focal and dice losses based on edge_weight parameters
+        # Create weight masks for focal and dice losses
         focal_weight_mask = None
         dice_weight_mask = None
+        edge_mask = None
+        narrow_channels = None
 
-        if self.focal_edge_weight is not None or self.dice_edge_weight is not None:
-            # Extract edge mask from target masks
-            edge_mask = extract_edge_mask(target_masks, edge_width=self.edge_width)
+        # Extract edge and narrow channel masks if needed
+        if self.focal_edge_weight is not None or self.dice_edge_weight is not None or self.narrow_channel_weight > 0:
+            edge_mask, narrow_channels = extract_edge_mask(target_masks, edge_width=self.edge_width)
 
             # Create focal loss weight mask
-            if self.focal_edge_weight is not None:
-                # Non-edge regions: weight = 1.0
-                # Edge regions: weight = focal_edge_weight (e.g., 0.0, 2.0, etc.)
+            if self.focal_edge_weight is not None or self.narrow_channel_weight > 0:
                 focal_weight_mask = torch.ones_like(target_masks)
-                focal_weight_mask = torch.where(
-                    edge_mask > 0,
-                    torch.full_like(edge_mask, self.focal_edge_weight),
-                    focal_weight_mask
-                )
+                # Apply edge weight if specified
+                if self.focal_edge_weight is not None:
+                    focal_weight_mask = torch.where(
+                        edge_mask > 0,
+                        torch.full_like(edge_mask, self.focal_edge_weight),
+                        focal_weight_mask
+                    )
+                # Apply narrow channel high weight (overrides edge weight)
+                if self.narrow_channel_weight > 0:
+                    focal_weight_mask = torch.where(
+                        narrow_channels > 0,
+                        torch.full_like(narrow_channels, self.narrow_channel_weight),
+                        focal_weight_mask
+                    )
 
             # Create dice loss weight mask
-            if self.dice_edge_weight is not None:
-                # Non-edge regions: weight = 1.0
-                # Edge regions: weight = dice_edge_weight (e.g., 0.0, 2.0, etc.)
+            if self.dice_edge_weight is not None or self.narrow_channel_weight > 0:
                 dice_weight_mask = torch.ones_like(target_masks)
-                dice_weight_mask = torch.where(
-                    edge_mask > 0,
-                    torch.full_like(edge_mask, self.dice_edge_weight),
-                    dice_weight_mask
-                )
+                # Apply edge weight if specified
+                if self.dice_edge_weight is not None:
+                    dice_weight_mask = torch.where(
+                        edge_mask > 0,
+                        torch.full_like(edge_mask, self.dice_edge_weight),
+                        dice_weight_mask
+                    )
+                # Apply narrow channel high weight (overrides edge weight)
+                if self.narrow_channel_weight > 0:
+                    dice_weight_mask = torch.where(
+                        narrow_channels > 0,
+                        torch.full_like(narrow_channels, self.narrow_channel_weight),
+                        dice_weight_mask
+                    )
 
         target_masks = target_masks.expand_as(src_masks)
 
@@ -436,8 +469,10 @@ class MultiStepMultiMasksAndIous(nn.Module):
         losses["loss_class"] += loss_class
 
         # Return loss_weight_mask for visualization
-        # return loss_weight_mask
-        return 1-edge_mask
+        if edge_mask is not None:
+            return 1 - edge_mask
+        else:
+            return torch.ones_like(target_masks)
 
     def reduce_loss(self, losses):
         reduced_loss = 0.0

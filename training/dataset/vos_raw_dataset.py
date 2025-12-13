@@ -377,3 +377,101 @@ class JSONRawDataset(VOSRawDataset):
 
     def __len__(self):
         return len(self.video_names)
+
+
+class DIS5KRawDataset(VOSRawDataset):
+    """
+    DIS5K (Dichotomous Image Segmentation) Dataset
+
+    Dataset structure:
+    - img_folder: contains .jpg images
+    - gt_folder: contains .png segmentation masks
+    - Images and masks share the same filename (different extensions)
+
+    Args:
+        img_folder: Path to folder containing images
+        gt_folder: Path to folder containing ground truth masks
+        file_list_txt: Optional text file containing subset of files to use
+        excluded_videos_list_txt: Optional text file containing files to exclude
+        num_frames: Number of frames to generate (default 1, for single image)
+    """
+
+    def __init__(
+        self,
+        img_folder,
+        gt_folder,
+        file_list_txt=None,
+        excluded_videos_list_txt=None,
+        num_frames=1,
+    ):
+        self.img_folder = img_folder
+        self.gt_folder = gt_folder
+        self.num_frames = num_frames
+
+        # Read the subset defined in file_list_txt
+        if file_list_txt is not None:
+            with g_pathmgr.open(file_list_txt, "r") as f:
+                subset = [os.path.splitext(line.strip())[0] for line in f]
+        else:
+            # Get all jpg files from image folder
+            all_files = os.listdir(self.img_folder)
+            subset = [
+                os.path.splitext(path)[0] for path in all_files if path.endswith(".jpg")
+            ]
+
+        # Read and process excluded files if provided
+        if excluded_videos_list_txt is not None:
+            with g_pathmgr.open(excluded_videos_list_txt, "r") as f:
+                excluded_files = [os.path.splitext(line.strip())[0] for line in f]
+        else:
+            excluded_files = []
+
+        # Filter out excluded files
+        self.video_names = sorted(
+            [video_name for video_name in subset if video_name not in excluded_files]
+        )
+
+    def get_video(self, idx):
+        """
+        Given an index, return a VOSVideo object and segment loader.
+
+        Args:
+            idx: Index of the sample
+
+        Returns:
+            video: VOSVideo object containing frame information
+            segment_loader: Loader for the segmentation mask
+        """
+        video_name = self.video_names[idx]
+
+        # Construct paths for image and mask
+        video_frame_path = os.path.join(self.img_folder, video_name + ".jpg")
+
+        # Check for mask file existence
+        mask_path = None
+        for ext in [".png"]:
+            candidate = os.path.join(self.gt_folder, video_name + ext)
+            if os.path.exists(candidate):
+                mask_path = candidate
+                break
+
+        if mask_path is None:
+            raise FileNotFoundError(
+                f"Mask file for {video_name} not found under {self.gt_folder}"
+            )
+
+        # Create segment loader for the mask
+        segment_loader = SingleImagePNGSegmentLoader(mask_path)
+
+        # Create frames (treating single image as video with num_frames frames)
+        frames = []
+        for frame_idx in range(self.num_frames):
+            frames.append(VOSFrame(frame_idx, image_path=video_frame_path))
+
+        # Create video object
+        video = VOSVideo(video_name, idx, frames)
+        return video, segment_loader
+
+    def __len__(self):
+        """Return the total number of samples in the dataset."""
+        return len(self.video_names)
