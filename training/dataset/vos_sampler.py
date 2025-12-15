@@ -62,7 +62,14 @@ class RandomUniformSampler(VOSSampler):
                 for object_id, segment in segment_loader.load(
                     frames[0].frame_idx
                 ).items():
-                    if segment.sum():
+                    # Handle new dict format with weight maps
+                    if isinstance(segment, dict):
+                        segment_tensor = segment['segment']
+                    else:
+                        # Backward compatibility with old format
+                        segment_tensor = segment
+
+                    if segment_tensor.sum():
                         visible_object_ids.append(object_id)
 
             # First frame needs to have at least a target to track

@@ -234,7 +234,7 @@ class SingleImagePNGSegmentLoader:
     that encodes object ids using pixel values.
     """
 
-    def __init__(self, mask_path, background_value: int = 0):
+    def __init__(self, mask_path, weight_map_path=None, background_value: int = 0):
         if not os.path.exists(mask_path):
             raise FileNotFoundError(f"Mask file {mask_path} not found.")
         mask = np.array(PILImage.open(mask_path))
@@ -245,18 +245,45 @@ class SingleImagePNGSegmentLoader:
         unique_ids = np.unique(mask)
         unique_ids = [int(i) for i in unique_ids if i != background_value]
         self.segments = {}
+        self.weight_maps = {}
         mask_tensor = torch.from_numpy(mask)
+
+        # Load weight map if provided (expects .npy format)
+        weight_map_tensor = None
+        if weight_map_path is not None and os.path.exists(weight_map_path):
+            # Load .npy file
+            weight_map = np.load(weight_map_path)
+            # Ensure it's 2D
+            if weight_map.ndim == 3:
+                weight_map = weight_map[:, :, 0]
+            weight_map_tensor = torch.from_numpy(weight_map).float()
+
         for obj_id in unique_ids:
             binary = (mask_tensor == obj_id)
             self.segments[obj_id] = binary
 
+            # Extract corresponding object's weight map
+            if weight_map_tensor is not None:
+                # Use the weight map for this object region
+                obj_weight_map = weight_map_tensor.clone()
+                self.weight_maps[obj_id] = obj_weight_map
+            else:
+                self.weight_maps[obj_id] = None
+
         if not self.segments:
             # fallback to a zero mask to avoid downstream crashes
             self.segments[1] = torch.zeros_like(mask_tensor, dtype=torch.bool)
+            self.weight_maps[1] = None
 
     def load(self, frame_id):
         # return clones so downstream augmentations can modify in-place
-        return {obj_id: seg.clone() for obj_id, seg in self.segments.items()}
+        return {
+            obj_id: {
+                'segment': seg.clone(),
+                'weight_map': self.weight_maps[obj_id].clone() if self.weight_maps[obj_id] is not None else None
+            }
+            for obj_id, seg in self.segments.items()
+        }
 
 
 class LazySegments:

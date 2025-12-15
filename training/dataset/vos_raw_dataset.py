@@ -156,9 +156,11 @@ class BoneRawDataset(VOSRawDataset):
         num_frames=1,
         mask_area_frac_thresh=1.1,  # no filtering by default
         uncertain_iou=-1,  # no filtering by default
+        weight_map_folder=None,  # folder containing pre-computed weight maps
     ):
         self.img_folder = img_folder
         self.gt_folder = gt_folder
+        self.weight_map_folder = weight_map_folder
         self.num_frames = num_frames
         self.mask_area_frac_thresh = mask_area_frac_thresh
         self.uncertain_iou = uncertain_iou  # stability score
@@ -203,7 +205,16 @@ class BoneRawDataset(VOSRawDataset):
                 f"Mask file for {video_name} not found under {self.gt_folder}"
             )
 
-        segment_loader = SingleImagePNGSegmentLoader(mask_path)
+        # Load weight map if weight_map_folder is provided (expects .npy format)
+        weight_map_path = None
+        if self.weight_map_folder is not None:
+            for ext in [".npy", ".npz"]:  # Support both .npy and .npz formats
+                candidate = os.path.join(self.weight_map_folder, video_name + ext)
+                if os.path.exists(candidate):
+                    weight_map_path = candidate
+                    break
+
+        segment_loader = SingleImagePNGSegmentLoader(mask_path, weight_map_path=weight_map_path)
 
         frames = []
         for frame_idx in range(self.num_frames):

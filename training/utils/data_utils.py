@@ -1,3 +1,4 @@
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -40,6 +41,7 @@ class BatchedVideoDatapoint:
         img_batch: A [TxBxCxHxW] tensor containing the image data for each frame in the batch, where T is the number of frames per video, and B is the number of videos in the batch.
         obj_to_frame_idx: A [TxOx2] tensor containing the image_batch index which the object belongs to. O is the number of objects in the batch.
         masks: A [TxOxHxW] tensor containing binary masks for each object in the batch.
+        weight_maps: A [TxOxHxW] tensor containing weight maps for each object in the batch (optional).
         metadata: An instance of BatchedVideoMetaData containing metadata about the batch.
         dict_key: A string key used to identify the batch.
     """
@@ -47,6 +49,7 @@ class BatchedVideoDatapoint:
     img_batch: torch.FloatTensor
     obj_to_frame_idx: torch.IntTensor
     masks: torch.BoolTensor
+    weight_maps: Optional[torch.FloatTensor]
     metadata: BatchedVideoMetaData
 
     dict_key: str
@@ -94,6 +97,7 @@ class Object:
     # Index of the frame in the media (0 if single image)
     frame_index: int
     segment: Union[torch.Tensor, dict]  # RLE dict or binary mask
+    weight_map: Optional[torch.Tensor] = None  # Weight map for loss weighting
 
 
 @dataclass
@@ -131,6 +135,7 @@ def collate_fn(
     step_t_frame_orig_size = [[] for _ in range(T)]
 
     step_t_masks = [[] for _ in range(T)]
+    step_t_weight_maps = [[] for _ in range(T)]
     step_t_obj_to_frame_idx = [
         [] for _ in range(T)
     ]  # List to store frame indices for each time step
@@ -147,6 +152,14 @@ def collate_fn(
                     torch.tensor([t, video_idx], dtype=torch.int)
                 )
                 step_t_masks[t].append(obj.segment.to(torch.bool))
+
+                # Collect weight maps
+                if obj.weight_map is not None:
+                    step_t_weight_maps[t].append(obj.weight_map.to(torch.float))
+                else:
+                    # If no weight map provided, use ones (no weighting)
+                    step_t_weight_maps[t].append(torch.ones_like(obj.segment, dtype=torch.float))
+
                 step_t_objects_identifier[t].append(
                     torch.tensor([orig_video_id, orig_obj_id, orig_frame_idx])
                 )
@@ -160,6 +173,7 @@ def collate_fn(
         dim=0,
     )
     masks = torch.stack([torch.stack(masks, dim=0) for masks in step_t_masks], dim=0)
+    weight_maps = torch.stack([torch.stack(wm, dim=0) for wm in step_t_weight_maps], dim=0)
     objects_identifier = torch.stack(
         [torch.stack(id, dim=0) for id in step_t_objects_identifier], dim=0
     )
@@ -170,6 +184,7 @@ def collate_fn(
         img_batch=img_batch,
         obj_to_frame_idx=obj_to_frame_idx,
         masks=masks,
+        weight_maps=weight_maps,
         metadata=BatchedVideoMetaData(
             unique_objects_identifier=objects_identifier,
             frame_orig_size=frame_orig_size,

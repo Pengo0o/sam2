@@ -107,19 +107,28 @@ class VOSDataset(VisionDataset):
                     assert (
                         segments[obj_id] is not None
                     ), "None targets are not supported"
-                    # segment is uint8 and remains uint8 throughout the transforms
-                    segment = segments[obj_id].to(torch.uint8)
+
+                    # Handle new dict format with weight maps
+                    if isinstance(segments[obj_id], dict):
+                        segment = segments[obj_id]['segment'].to(torch.uint8)
+                        weight_map = segments[obj_id]['weight_map']
+                    else:
+                        # Backward compatibility with old format
+                        segment = segments[obj_id].to(torch.uint8)
+                        weight_map = None
                 else:
                     # There is no target, we either use a zero mask target or drop this object
                     if not self.always_target:
                         continue
                     segment = torch.zeros(h, w, dtype=torch.uint8)
+                    weight_map = None
 
                 images[frame_idx].objects.append(
                     Object(
                         object_id=obj_id,
                         frame_index=frame.frame_idx,
                         segment=segment,
+                        weight_map=weight_map,
                     )
                 )
         return VideoDatapoint(

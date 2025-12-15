@@ -237,6 +237,7 @@ trainer:
           _target_: training.dataset.vos_raw_dataset.BoneRawDataset
           img_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2026/image
           gt_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2026/gt_1024
+          weight_map_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2026/weight_maps/small_area_mask
           file_list_txt: training/assets/HELS_train_6_2_2.txt # Optional
         sampler:
           _target_: training.dataset.vos_sampler.RandomUniformSampler
@@ -337,7 +338,7 @@ trainer:
       focal_alpha_obj_score: -1.0
       ignore_edge_loss: true  # Ignore edge regions for medical bone images
       edge_width: 3
-      focal_edge_smallarea_weight: 4.0
+      focal_edge_smallarea_weight: 10.0
       focal_edge_weight: 0.0
       dice_edge_weight: 0.0
 
@@ -376,7 +377,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: output_1212_sam2.1_hiera_l_hels_finetune+lora_+new_loss_+boundary_weight+small_area_penalty # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: output_1213_sam2.1_hiera_l_hels_finetune+lora_+new_loss_+boundary_weight+small_area_penalty # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:
