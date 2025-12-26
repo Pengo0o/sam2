@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument('--config', type=str, default='configs/sam2.1/sam2.1_hiera_l.yaml',
                         help='Path to SAM2 config file')
     parser.add_argument('--checkpoint', type=str,
-                        default="output_1205_sam2.1_hiera_l_hels_finetune+lora+new_loss_with_mask+dis5k+boundary_weight/checkpoints/checkpoint_260.pt",
+                        default="output_1212_sam2.1_hiera_l_hels_finetune+lora_+new_loss_+boundary_weight+small_area_penalty/checkpoints/checkpoint_300.pt",
                         help='Path to model checkpoint')
     parser.add_argument('--device', type=str, default='cuda:0',
                         help='Device to run on')
@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument('--mask-ext', type=str, default='.png',
                         help='Mask file extension')
 
-    parser.add_argument('--output-dir', type=str, default='testing/output_1205_sam2.1_hiera_l_hels_finetune+lora+new_loss_with_mask+dis5k+boundary_weight',
+    parser.add_argument('--output-dir', type=str, default='testing/output_1212_sam2.1_hiera_l_hels_finetune+lora_+new_loss_+boundary_weight+small_area_penalty',
                         help='Output directory for results')
 
     # Evaluation arguments

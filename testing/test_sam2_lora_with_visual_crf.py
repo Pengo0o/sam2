@@ -1,4 +1,6 @@
 """
+SAM2 + SimpleClick + CRF 迭代式推理测试脚本
+包含可视化和详细的评测指标
 """
 
 import sys
@@ -17,11 +19,11 @@ import json
 from sam2.build_sam import build_sam2_with_lora
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from training.utils.train_utils import register_omegaconf_resolvers
-from sam2_simpleclick_adapter import SAM2ClickerAdapter
+from sam2_simpleclick_adapter_CRF import SAM2ClickerAdapterCRF
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Test SAM2 with SimpleClick iterative strategy")
+    parser = argparse.ArgumentParser(description="Test SAM2 with SimpleClick + CRF iterative strategy")
 
     # Model arguments
     parser.add_argument('--config', type=str, default='configs/sam2.1/sam2.1_hiera_l.yaml',
@@ -56,7 +58,8 @@ def parse_args():
     parser.add_argument('--mask-ext', type=str, default='.png',
                         help='Mask file extension')
 
-    parser.add_argument('--output-dir', type=str, default='testing/output_1212_sam2.1_hiera_l_hels_finetune+lora_+new_loss_+boundary_weight+small_area_penalty',
+    parser.add_argument('--output-dir', type=str,
+                        default='testing/output_1212_sam2.1_hiera_l_hels_finetune+lora_+new_loss_+boundary_weight+small_area_penalty_crf',
                         help='Output directory for results')
 
     # Evaluation arguments
@@ -66,6 +69,22 @@ def parse_args():
                         help='Target IoU threshold')
     parser.add_argument('--pred-threshold', type=float, default=0.49,
                         help='Prediction threshold for binary mask')
+
+    # CRF arguments
+    parser.add_argument('--use-crf', action='store_true', default=True,
+                        help='Use CRF post-processing')
+    parser.add_argument('--crf-iterations', type=int, default=5,
+                        help='Number of CRF iterations')
+    parser.add_argument('--crf-sxy-gaussian', type=float, default=1,
+                        help='CRF Gaussian pairwise potential spatial std')
+    parser.add_argument('--crf-compat-gaussian', type=float, default=5.0,
+                        help='CRF Gaussian pairwise potential compatibility')
+    parser.add_argument('--crf-sxy-bilateral', type=float, default=60,
+                        help='CRF Bilateral pairwise potential spatial std')
+    parser.add_argument('--crf-srgb-bilateral', type=float, default=5,
+                        help='CRF Bilateral pairwise potential color std')
+    parser.add_argument('--crf-compat-bilateral', type=float, default=20,
+                        help='CRF Bilateral pairwise potential compatibility')
 
     # Visualization arguments
     parser.add_argument('--visualize', action='store_true',
@@ -108,7 +127,7 @@ def load_sam2_model(args):
             lora_target_modules=lora_target_modules,
         )
 
-        print(f" SAM2 model loaded with LoRA (rank={args.lora_rank}, "
+        print(f"✓ SAM2 model loaded with LoRA (rank={args.lora_rank}, "
               f"dropout={args.lora_dropout}, target_modules={lora_target_modules})")
 
     return sam2_model
@@ -151,7 +170,7 @@ def get_image_mask_pairs(args):
         # Get all image files
         image_exts = args.image_ext.split(',')
         image_files = []
-        
+
         # test split
         with open("/opt/data/private/lls/HLES-SAM/data/CVPR2026/patients_test_6_2_2.txt","r") as f:
             lines = f.readlines()
@@ -174,9 +193,12 @@ def get_image_mask_pairs(args):
     return pairs
 
 
-def visualize_result(image, gt_mask, pred_mask, clicks_list, iou, save_path):
-    """Visualize prediction result"""
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+def visualize_result_with_crf(image, gt_mask, pred_mask, clicks_list, iou, save_path,
+                               pred_mask_no_crf=None, iou_no_crf=None):
+    """Visualize prediction result with CRF comparison"""
+    # 4 subplots if CRF comparison is available, otherwise 3
+    n_plots = 4 if pred_mask_no_crf is not None else 3
+    fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
 
     # 1. Original image with clicks
     axes[0].imshow(image)
@@ -191,50 +213,80 @@ def visualize_result(image, gt_mask, pred_mask, clicks_list, iou, save_path):
 
     # 2. Ground truth
     axes[1].imshow(image)
-    axes[1].imshow(gt_mask, alpha=0.5, cmap='jet')
+    axes[1].imshow(gt_mask, alpha=0.5, cmap='jet', interpolation='nearest')
     axes[1].set_title('Ground Truth', fontsize=12)
     axes[1].axis('off')
 
-    # 3. Prediction
-    axes[2].imshow(image)
-    axes[2].imshow(pred_mask, alpha=0.5, cmap='jet')
-    axes[2].set_title(f'Prediction (IoU={iou:.4f})', fontsize=12)
-    axes[2].axis('off')
+    # 3. Prediction without CRF (if available)
+    if pred_mask_no_crf is not None:
+        axes[2].imshow(image)
+        axes[2].imshow(pred_mask_no_crf, alpha=0.5, cmap='jet', interpolation='nearest')
+        axes[2].set_title(f'Without CRF (IoU={iou_no_crf:.4f})', fontsize=12)
+        axes[2].axis('off')
 
-    # 4. Error map
-    fn_mask = np.logical_and(gt_mask, np.logical_not(pred_mask))
-    fp_mask = np.logical_and(np.logical_not(gt_mask), pred_mask)
-    error_map = np.zeros((*gt_mask.shape, 3))
-    error_map[fn_mask] = [1, 0, 0]  # False Negative: Red
-    error_map[fp_mask] = [0, 0, 1]  # False Positive: Blue
-    axes[3].imshow(image)
-    axes[3].imshow(error_map, alpha=0.5)
-    axes[3].set_title(f'Error Map (Red=FN, Blue=FP)', fontsize=12)
-    axes[3].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def save_best_mask_overlay(image, best_mask, best_iou, best_click_idx, save_path):
-    """Save best prediction mask overlayed on original image"""
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-
-    # Display original image
-    ax.imshow(image)
-
-    # Overlay best mask with transparency
-    ax.imshow(best_mask, alpha=0.5, cmap='jet')
-
-    # Add title with best IoU and click info
-    ax.set_title(f'Best Prediction: IoU={best_iou:.4f} at Click {best_click_idx}',
-                 fontsize=14, fontweight='bold')
-    ax.axis('off')
+        # 4. Prediction with CRF
+        axes[3].imshow(image)
+        axes[3].imshow(pred_mask, alpha=0.5, cmap='jet', interpolation='nearest')
+        crf_gain = iou - iou_no_crf
+        axes[3].set_title(f'With CRF (IoU={iou:.4f}, +{crf_gain:.4f})', fontsize=12)
+        axes[3].axis('off')
+    else:
+        # 3. Prediction only
+        axes[2].imshow(image)
+        axes[2].imshow(pred_mask, alpha=0.5, cmap='jet', interpolation='nearest')
+        axes[2].set_title(f'Prediction (IoU={iou:.4f})', fontsize=12)
+        axes[2].axis('off')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
+
+
+def save_best_mask_overlay(image, best_mask, best_iou, best_click_idx, save_path,
+                          use_crf=False, crf_gain=None):
+    """Save best prediction mask overlayed on original image using OpenCV"""
+    # Ensure image is in the correct format
+    if image.dtype != np.uint8:
+        image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
+
+    # Convert RGB to BGR for OpenCV
+    img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+    # Convert mask to uint8 [0, 255]
+    if best_mask.dtype == bool or best_mask.max() <= 1.0:
+        mask_np = (best_mask * 255).astype(np.uint8)
+    else:
+        mask_np = best_mask.astype(np.uint8)
+
+    # Apply JET colormap to mask
+    mask_colored = cv2.applyColorMap(mask_np, cv2.COLORMAP_JET)
+
+    # Create overlay by blending image and colored mask
+    overlay = cv2.addWeighted(img_bgr, 0.5, mask_colored, 0.5, 0)
+
+    # Add title text with smaller, clearer font
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.4
+    thickness = 1
+
+    if use_crf and crf_gain is not None:
+        text = f'Best: IoU={best_iou:.4f} @ Click {best_click_idx} (CRF gain: +{crf_gain:.4f})'
+    else:
+        text = f'Best Prediction: IoU={best_iou:.4f} at Click {best_click_idx}'
+
+    # Get text size to create a background box
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+    # Add black background for text for better visibility
+    cv2.rectangle(overlay, (10, 10), (text_width + 20, text_height + baseline + 20),
+                  (0, 0, 0), -1)
+
+    # Add white text
+    cv2.putText(overlay, text, (15, text_height + 15), font, font_scale,
+                (255, 255, 255), thickness, cv2.LINE_AA)
+
+    # Save image with high quality
+    cv2.imwrite(str(save_path), overlay, [cv2.IMWRITE_PNG_COMPRESSION, 3])
 
 
 def compute_noc_metric(all_ious, iou_thrs=[0.80, 0.85, 0.90], max_clicks=25):
@@ -281,8 +333,9 @@ def compute_miou_at_k(all_ious, k_values=[1, 3, 5, 10, 15, 20, 25]):
     return miou_dict
 
 
-def plot_average_iou_curve(all_ious, save_path, iou_thrs=[0.80, 0.85, 0.90]):
-    """Plot average IoU progression curve"""
+def plot_average_iou_curve(all_ious, save_path, iou_thrs=[0.80, 0.85, 0.90],
+                          all_ious_no_crf=None):
+    """Plot average IoU progression curve with optional CRF comparison"""
     # Compute average IoU at each click
     max_len = max(len(ious) for ious in all_ious)
     avg_ious = []
@@ -303,9 +356,23 @@ def plot_average_iou_curve(all_ious, save_path, iou_thrs=[0.80, 0.85, 0.90]):
 
     # Plot
     plt.figure(figsize=(12, 7))
-    plt.plot(clicks, avg_ious, 'b-o', linewidth=2, markersize=6, label='Average IoU')
+    plt.plot(clicks, avg_ious, 'b-o', linewidth=2, markersize=6, label='Average IoU (with CRF)')
     plt.fill_between(clicks, avg_ious - std_ious, avg_ious + std_ious,
-                     alpha=0.2, color='blue', label='?1 std')
+                     alpha=0.2, color='blue', label='±1 std')
+
+    # Plot without CRF if available
+    if all_ious_no_crf is not None and all_ious_no_crf[0] and all_ious_no_crf[0][0] is not None:
+        avg_ious_no_crf = []
+        for k in range(max_len):
+            iou_at_k = [ious[k] for ious in all_ious_no_crf if len(ious) > k and ious[k] is not None]
+            if iou_at_k:
+                avg_ious_no_crf.append(np.mean(iou_at_k))
+            else:
+                avg_ious_no_crf.append(np.nan)
+
+        avg_ious_no_crf = np.array(avg_ious_no_crf)
+        plt.plot(clicks, avg_ious_no_crf, 'r--o', linewidth=2, markersize=4,
+                label='Average IoU (without CRF)', alpha=0.7)
 
     # Add threshold lines
     colors = ['green', 'orange', 'red']
@@ -327,14 +394,20 @@ def plot_average_iou_curve(all_ious, save_path, iou_thrs=[0.80, 0.85, 0.90]):
 
 
 def test_multiple_images(args):
-    """Test on multiple images"""
+    """Test on multiple images with CRF post-processing"""
     print("=" * 80)
-    print("SAM2 + SimpleClick Batch Evaluation")
+    print("SAM2 + SimpleClick + CRF Batch Evaluation")
     print("=" * 80)
+    print(f"CRF enabled: {args.use_crf}")
+    if args.use_crf:
+        print(f"  - Iterations: {args.crf_iterations}")
+        print(f"  - Gaussian (sxy={args.crf_sxy_gaussian}, compat={args.crf_compat_gaussian})")
+        print(f"  - Bilateral (sxy={args.crf_sxy_bilateral}, srgb={args.crf_srgb_bilateral}, "
+              f"compat={args.crf_compat_bilateral})")
 
     # Get image-mask pairs
     pairs = get_image_mask_pairs(args)
-    print(f"\n Found {len(pairs)} image-mask pairs")
+    print(f"\n✓ Found {len(pairs)} image-mask pairs")
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -344,11 +417,22 @@ def test_multiple_images(args):
     sam2_model = load_sam2_model(args)
     predictor = SAM2ImagePredictor(sam2_model)
 
-    # Create adapter
-    adapter = SAM2ClickerAdapter(predictor, pred_threshold=args.pred_threshold)
+    # Create adapter with CRF
+    adapter = SAM2ClickerAdapterCRF(
+        predictor,
+        pred_threshold=args.pred_threshold,
+        use_crf=args.use_crf,
+        crf_iterations=args.crf_iterations,
+        crf_sxy_gaussian=args.crf_sxy_gaussian,
+        crf_compat_gaussian=args.crf_compat_gaussian,
+        crf_sxy_bilateral=args.crf_sxy_bilateral,
+        crf_srgb_bilateral=args.crf_srgb_bilateral,
+        crf_compat_bilateral=args.crf_compat_bilateral
+    )
 
     # Store results
     all_ious = []
+    all_ious_no_crf = []
     all_results = []
 
     print("\n" + "=" * 80)
@@ -365,40 +449,62 @@ def test_multiple_images(args):
             # Load data
             image, gt_mask = load_image_and_mask(image_path, mask_path)
 
-            # Run iterative prediction
-            ious_list, final_mask, clicks_list, best_mask, best_click_idx = adapter.iterative_predict(
+            # Run iterative prediction with CRF
+            ious_list, final_mask, clicks_list, best_mask, best_click_idx, ious_no_crf = adapter.iterative_predict(
                 image=image,
                 gt_mask=gt_mask,
                 max_clicks=args.max_clicks,
                 target_iou=args.target_iou,
-                multimask_output=True
+                multimask_output=True,
+                verbose=True # Disable per-click printing in batch mode
             )
 
             # Store results
             all_ious.append(ious_list)
+            all_ious_no_crf.append(ious_no_crf)
             best_iou = max(ious_list)
+
+            # Compute CRF gain
+            crf_gain = None
+            if args.use_crf and ious_no_crf and ious_no_crf[best_click_idx - 1] is not None:
+                best_iou_no_crf = ious_no_crf[best_click_idx - 1]
+                crf_gain = best_iou - best_iou_no_crf
+
             result = {
                 'image_name': image_path.name,
-                'ious': [float(iou) for iou in ious_list],  # Convert to native Python float
+                'ious': [float(iou) for iou in ious_list],
+                'ious_no_crf': [float(iou) if iou is not None else None for iou in ious_no_crf],
                 'num_clicks': len(clicks_list),
                 'final_iou': float(ious_list[-1]),
                 'max_iou': float(best_iou),
                 'best_click_idx': best_click_idx,
-                'reached_target': bool(ious_list[-1] >= args.target_iou)  # Convert to native Python bool
+                'reached_target': bool(ious_list[-1] >= args.target_iou),
+                'crf_gain': float(crf_gain) if crf_gain is not None else None
             }
             all_results.append(result)
 
-            # Save best mask overlay (always save for all images)
+            # Save best mask overlay
             best_mask_path = best_masks_dir / f"{image_path.stem}_best.png"
-            save_best_mask_overlay(image, best_mask, best_iou, best_click_idx, best_mask_path)
+            save_best_mask_overlay(image, best_mask, best_iou, best_click_idx, best_mask_path,
+                                 use_crf=args.use_crf, crf_gain=crf_gain)
 
             # Visualize if needed
             if args.visualize and (args.visualize_all or not result['reached_target']):
                 viz_dir = output_dir / 'visualizations'
                 viz_dir.mkdir(exist_ok=True)
                 viz_path = viz_dir / f"{image_path.stem}_result.png"
-                visualize_result(image, gt_mask, final_mask, clicks_list,
-                               ious_list[-1], viz_path)
+
+                # Get mask without CRF for comparison
+                pred_mask_no_crf = None
+                iou_no_crf_final = None
+                if args.use_crf and ious_no_crf[-1] is not None:
+                    # We don't have the actual mask without CRF, only IoU
+                    # So we skip the 4-panel visualization for now
+                    pass
+
+                visualize_result_with_crf(image, gt_mask, final_mask, clicks_list,
+                                        ious_list[-1], viz_path,
+                                        pred_mask_no_crf, iou_no_crf_final)
 
         except Exception as e:
             print(f"\nError processing {image_path.name}: {e}")
@@ -426,6 +532,9 @@ def test_multiple_images(args):
     num_clicks_list = [result['num_clicks'] for result in all_results]
     reached_target_count = sum(result['reached_target'] for result in all_results)
 
+    # CRF gain statistics
+    crf_gains = [result['crf_gain'] for result in all_results if result['crf_gain'] is not None]
+
     # Print results
     print("\n" + "=" * 80)
     print("Evaluation Results")
@@ -434,11 +543,17 @@ def test_multiple_images(args):
     print(f"Reached target (IoU>={args.target_iou:.2f}): {reached_target_count}/{len(all_ious)} "
           f"({reached_target_count/len(all_ious)*100:.1f}%)")
 
+    if args.use_crf and crf_gains:
+        print(f"\nCRF Performance:")
+        print(f"  Average gain: {np.mean(crf_gains):.4f} ± {np.std(crf_gains):.4f}")
+        print(f"  Min/Max gain: {np.min(crf_gains):.4f} / {np.max(crf_gains):.4f}")
+        print(f"  Positive gain rate: {sum(1 for g in crf_gains if g > 0) / len(crf_gains) * 100:.1f}%")
+
     print("\n" + "-" * 80)
     print("NoC (Number of Clicks) Metrics:")
     print("-" * 80)
     for iou_thr in iou_thrs:
-        print(f"  NoC@{iou_thr:.0%}: {noc_dict[iou_thr]:.2f} / {noc_std_dict[iou_thr]:.2f}")
+        print(f"  NoC@{iou_thr:.0%}: {noc_dict[iou_thr]:.2f} ± {noc_std_dict[iou_thr]:.2f}")
         print(f"  >={args.max_clicks}@{iou_thr:.0%}: {over_max_dict[iou_thr]*100:.1f}%")
 
     print("\n" + "-" * 80)
@@ -451,8 +566,8 @@ def test_multiple_images(args):
     print("\n" + "-" * 80)
     print("Overall Statistics:")
     print("-" * 80)
-    print(f"  Average final IoU: {np.mean(final_ious):.4f} / {np.std(final_ious):.4f}")
-    print(f"  Average clicks: {np.mean(num_clicks_list):.2f} / {np.std(num_clicks_list):.2f}")
+    print(f"  Average final IoU: {np.mean(final_ious):.4f} ± {np.std(final_ious):.4f}")
+    print(f"  Average clicks: {np.mean(num_clicks_list):.2f} ± {np.std(num_clicks_list):.2f}")
     print(f"  Min/Max final IoU: {np.min(final_ious):.4f} / {np.max(final_ious):.4f}")
     print(f"  Min/Max clicks: {np.min(num_clicks_list)} / {np.max(num_clicks_list)}")
 
@@ -465,13 +580,14 @@ def test_multiple_images(args):
     results_path = output_dir / 'detailed_results.json'
     with open(results_path, 'w') as f:
         json.dump(all_results, f, indent=2)
-    print(f" Detailed results saved to: {results_path}")
+    print(f"✓ Detailed results saved to: {results_path}")
 
     # Save summary metrics
     summary = {
         'num_samples': len(all_ious),
         'max_clicks': args.max_clicks,
         'target_iou': args.target_iou,
+        'use_crf': args.use_crf,
         'reached_target_count': reached_target_count,
         'reached_target_ratio': reached_target_count / len(all_ious),
         'noc_metrics': {f'NoC@{k:.0%}': v for k, v in noc_dict.items()},
@@ -484,37 +600,52 @@ def test_multiple_images(args):
         'std_clicks': float(np.std(num_clicks_list)),
     }
 
+    # Add CRF statistics
+    if args.use_crf and crf_gains:
+        summary['crf_stats'] = {
+            'avg_gain': float(np.mean(crf_gains)),
+            'std_gain': float(np.std(crf_gains)),
+            'min_gain': float(np.min(crf_gains)),
+            'max_gain': float(np.max(crf_gains)),
+            'positive_gain_rate': float(sum(1 for g in crf_gains if g > 0) / len(crf_gains))
+        }
+
     summary_path = output_dir / 'summary_metrics.json'
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f" Summary metrics saved to: {summary_path}")
+    print(f"✓ Summary metrics saved to: {summary_path}")
 
     # Save IoU curve
     curve_path = output_dir / 'average_iou_curve.png'
-    plot_average_iou_curve(all_ious, curve_path, iou_thrs=iou_thrs)
-    print(f" Average IoU curve saved to: {curve_path}")
+    plot_average_iou_curve(all_ious, curve_path, iou_thrs=iou_thrs,
+                          all_ious_no_crf=all_ious_no_crf if args.use_crf else None)
+    print(f"✓ Average IoU curve saved to: {curve_path}")
 
     # Inform about best predictions
-    print(f" Best predictions saved to: {best_masks_dir}")
+    print(f"✓ Best predictions saved to: {best_masks_dir}")
     print(f"   (Total: {len(all_results)} images)")
 
     # Save text report
     report_path = output_dir / 'evaluation_report.txt'
     with open(report_path, 'w') as f:
         f.write("=" * 80 + "\n")
-        f.write("SAM2 + SimpleClick Evaluation Report\n")
+        f.write("SAM2 + SimpleClick + CRF Evaluation Report\n")
         f.write("=" * 80 + "\n\n")
 
         f.write(f"Model: {args.checkpoint}\n")
         f.write(f"Total samples: {len(all_ious)}\n")
         f.write(f"Max clicks: {args.max_clicks}\n")
-        f.write(f"Target IoU: {args.target_iou:.2f}\n\n")
+        f.write(f"Target IoU: {args.target_iou:.2f}\n")
+        f.write(f"CRF enabled: {args.use_crf}\n")
+        if args.use_crf and crf_gains:
+            f.write(f"Average CRF gain: {np.mean(crf_gains):.4f} ± {np.std(crf_gains):.4f}\n")
+        f.write("\n")
 
         f.write("-" * 80 + "\n")
         f.write("NoC Metrics:\n")
         f.write("-" * 80 + "\n")
         for iou_thr in iou_thrs:
-            f.write(f"NoC@{iou_thr:.0%}: {noc_dict[iou_thr]:.2f} ? {noc_std_dict[iou_thr]:.2f}\n")
+            f.write(f"NoC@{iou_thr:.0%}: {noc_dict[iou_thr]:.2f} ± {noc_std_dict[iou_thr]:.2f}\n")
 
         f.write("\n" + "-" * 80 + "\n")
         f.write("mIoU@k Metrics:\n")
@@ -527,13 +658,16 @@ def test_multiple_images(args):
         f.write("Per-Image Results:\n")
         f.write("-" * 80 + "\n")
         for result in all_results:
+            crf_info = ""
+            if result['crf_gain'] is not None:
+                crf_info = f", CRF gain={result['crf_gain']:+.4f}"
             f.write(f"{result['image_name']:30s}: "
                    f"Final IoU={result['final_iou']:.4f}, "
                    f"Best IoU={result['max_iou']:.4f} @ Click {result['best_click_idx']}, "
-                   f"Clicks={result['num_clicks']:2d}, "
-                   f"Target={'' if result['reached_target'] else ''}\n")
+                   f"Clicks={result['num_clicks']:2d}{crf_info}, "
+                   f"Target={'✓' if result['reached_target'] else '✗'}\n")
 
-    print(f" Text report saved to: {report_path}")
+    print(f"✓ Text report saved to: {report_path}")
 
     print("\n" + "=" * 80)
     print("Evaluation Complete!")
