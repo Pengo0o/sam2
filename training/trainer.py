@@ -489,6 +489,9 @@ class Trainer:
         batch_size = len(batch.img_batch)
 
         key = batch.dict_key  # key for dataset
+        num_frames = batch.num_frames
+        data_type = "video" if num_frames > 1 else "image"
+
         loss = self.loss[key](outputs, targets)
         loss_str = f"Losses/{phase}_{key}_loss"
 
@@ -512,6 +515,13 @@ class Trainer:
                 loss,
                 self.steps[phase],
             )
+
+            # Log data type information periodically (every 10x log frequency)
+            if self.steps[phase] % (self.logging_conf.log_scalar_frequency * 10) == 0:
+                logging.info(
+                    f"Step {self.steps[phase]}: {loss_str} = {loss:.4f} "
+                    f"(source: {key}, type: {data_type}, frames: {num_frames})"
+                )
 
         self.steps[phase] += 1
 
