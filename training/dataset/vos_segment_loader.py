@@ -316,6 +316,144 @@ class LazySegments:
         return self.segments.keys()
 
 
+class MultiplePNGSegmentLoaderWithWeightMap:
+    """
+    SegmentLoader for video datasets with multiple objects and weight maps.
+    Supports both single_object_mode and multi-object mode.
+    """
+    def __init__(self, video_png_root, weight_map_root=None, single_object_mode=False):
+        """
+        video_png_root: the folder contains all the masks stored in png
+        weight_map_root: the folder contains all the weight maps stored in npy/npz (optional)
+        single_object_mode: whether to load only a single object at a time
+        """
+        self.video_png_root = video_png_root
+        self.weight_map_root = weight_map_root
+        self.single_object_mode = single_object_mode
+
+        # read a mask to know the resolution of the video
+        if self.single_object_mode:
+            tmp_mask_path = glob.glob(os.path.join(video_png_root, "*.png"))[0]
+        else:
+            tmp_mask_path = glob.glob(os.path.join(video_png_root, "*", "*.png"))[0]
+        tmp_mask = np.array(PILImage.open(tmp_mask_path))
+        self.H = tmp_mask.shape[0]
+        self.W = tmp_mask.shape[1]
+
+        if self.single_object_mode:
+            self.obj_id = (
+                int(video_png_root.split("/")[-1]) + 1
+            )  # offset by 1 as bg is 0
+        else:
+            self.obj_id = None
+
+    def load(self, frame_id):
+        if self.single_object_mode:
+            return self._load_single_png(frame_id)
+        else:
+            return self._load_multiple_pngs(frame_id)
+
+    def _load_single_png(self, frame_id):
+        """
+        Load single png and corresponding weight map from disk
+        Args:
+            frame_id: int, define the mask path
+        Return:
+            binary_segments: dict with format {obj_id: {'segment': tensor, 'weight_map': tensor}}
+        """
+        mask_path = os.path.join(self.video_png_root, f"{frame_id:05d}.png")
+        binary_segments = {}
+
+        if os.path.exists(mask_path):
+            mask = np.array(PILImage.open(mask_path))
+        else:
+            # if png doesn't exist, empty mask
+            mask = np.zeros((self.H, self.W), dtype=bool)
+
+        segment = torch.from_numpy(mask > 0)
+
+        # Load weight map if weight_map_root is provided
+        weight_map = None
+        if self.weight_map_root is not None:
+            weight_map_path = None
+            for ext in [".npy", ".npz"]:
+                candidate = os.path.join(self.weight_map_root, f"{frame_id:05d}{ext}")
+                if os.path.exists(candidate):
+                    weight_map_path = candidate
+                    break
+
+            if weight_map_path is not None:
+                weight_map_data = np.load(weight_map_path)
+                if weight_map_data.ndim == 3:
+                    weight_map_data = weight_map_data[:, :, 0]
+                weight_map = torch.from_numpy(weight_map_data).float()
+
+        binary_segments[self.obj_id] = {
+            'segment': segment,
+            'weight_map': weight_map
+        }
+        return binary_segments
+
+    def _load_multiple_pngs(self, frame_id):
+        """
+        Load multiple png masks and corresponding weight maps from disk
+        Args:
+            frame_id: int, define the mask path
+        Return:
+            binary_segments: dict with format {obj_id: {'segment': tensor, 'weight_map': tensor}}
+        """
+        # get the path
+        all_objects = sorted(glob.glob(os.path.join(self.video_png_root, "*")))
+        num_objects = len(all_objects)
+        assert num_objects > 0
+
+        # load the masks and weight maps
+        binary_segments = {}
+        for obj_folder in all_objects:
+            # obj_folder is {video_name}/{obj_id}, obj_id is specified by the name of the folder
+            obj_id = int(obj_folder.split("/")[-1])
+            obj_id = obj_id + 1  # offset 1 as bg is 0
+
+            # Load mask
+            mask_path = os.path.join(obj_folder, f"{frame_id:05d}.png")
+            if os.path.exists(mask_path):
+                mask = np.array(PILImage.open(mask_path))
+            else:
+                mask = np.zeros((self.H, self.W), dtype=bool)
+
+            segment = torch.from_numpy(mask > 0)
+
+            # Load weight map if weight_map_root is provided
+            weight_map = None
+            if self.weight_map_root is not None:
+                # Weight map folder structure mirrors annotation structure
+                obj_folder_name = obj_folder.split("/")[-1]
+                weight_map_obj_folder = os.path.join(self.weight_map_root, obj_folder_name)
+
+                weight_map_path = None
+                for ext in [".npy", ".npz"]:
+                    candidate = os.path.join(weight_map_obj_folder, f"{frame_id:05d}{ext}")
+                    if os.path.exists(candidate):
+                        weight_map_path = candidate
+                        break
+
+                if weight_map_path is not None:
+                    weight_map_data = np.load(weight_map_path)
+                    if weight_map_data.ndim == 3:
+                        weight_map_data = weight_map_data[:, :, 0]
+                    weight_map = torch.from_numpy(weight_map_data).float()
+
+            binary_segments[obj_id] = {
+                'segment': segment,
+                'weight_map': weight_map
+            }
+
+        return binary_segments
+
+    def __len__(self):
+        return
+
+
 class SA1BSegmentLoader:
     def __init__(
         self,

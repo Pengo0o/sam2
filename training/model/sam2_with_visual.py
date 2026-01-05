@@ -572,142 +572,227 @@ class SAM2Train(SAM2Base):
             # Create visualization directory if it doesn't exist
             os.makedirs(self.visualize_dir, exist_ok=True)
 
-            # Get the first frame for visualization
-            frame_idx = 0
-            img = input.flat_img_batch[frame_idx]  # Shape: [C, H, W]
+            # Detect if this is a video batch or single image
+            num_frames = input.num_frames
 
-            # Get prediction mask (high resolution)
-            pred_mask = pred[frame_idx]['pred_masks_high_res'][0, 0]  # Shape: [H, W]
+            if num_frames > 1:
+                # Video sequence visualization
+                self._visualize_video_sequence(input, backbone_out, pred)
+            else:
+                # Single frame visualization
+                self._visualize_single_frame(input, backbone_out, pred)
 
-            # Get ground truth mask
-            gt_mask = input.masks[frame_idx][0]  # Shape: [H, W]
+        except Exception as e:
+            logging.warning(f"Visualization failed: {e}")
 
-            # Denormalize image (ImageNet normalization)
+    def _visualize_single_frame(self, input, backbone_out, pred):
+        """
+        Visualize single frame segmentation (for image data).
+        """
+        # Get the first frame for visualization
+        frame_idx = 0
+        img = input.flat_img_batch[frame_idx]  # Shape: [C, H, W]
+
+        # Get prediction mask (high resolution)
+        pred_mask = pred[frame_idx]['pred_masks_high_res'][0, 0]  # Shape: [H, W]
+
+        # Get ground truth mask
+        gt_mask = input.masks[frame_idx][0]  # Shape: [H, W]
+
+        # Denormalize image (ImageNet normalization)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
+        img_denorm = img * std + mean
+        img_denorm = torch.clamp(img_denorm * 255, 0, 255)
+        img_np = img_denorm.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        img_np = np.ascontiguousarray(img_np)
+
+        # Convert to BGR for OpenCV
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # Convert prediction mask to uint8
+        pred_mask_np = (torch.sigmoid(pred_mask) > 0.5).float()
+        pred_mask_np = (pred_mask_np * 255).cpu().numpy().astype(np.uint8)
+
+        # Convert ground truth mask to uint8
+        gt_mask_np = (gt_mask * 255).cpu().numpy().astype(np.uint8)
+
+        # Create colored overlays
+        # Green overlay for prediction
+        pred_overlay = img_bgr.copy()
+        pred_mask_colored = cv2.applyColorMap(pred_mask_np, cv2.COLORMAP_JET)
+        pred_overlay = cv2.addWeighted(pred_overlay, 0.6, pred_mask_colored, 0.4, 0)
+
+        # Blue overlay for ground truth
+        gt_overlay = img_bgr.copy()
+        gt_mask_colored = cv2.applyColorMap(gt_mask_np, cv2.COLORMAP_JET)
+        gt_overlay = cv2.addWeighted(gt_overlay, 0.6, gt_mask_colored, 0.4, 0)
+
+        # Draw points/box if they exist
+        # Try to get all iterative points from pred first (includes all correction clicks)
+        point_inputs = None
+        if 'multistep_point_inputs' in pred[frame_idx]:
+            # Get the final step's points (which includes all accumulated points)
+            multistep_points = pred[frame_idx]['multistep_point_inputs']
+            if isinstance(multistep_points, list) and len(multistep_points) > 0:
+                point_inputs = multistep_points[-1]  # Last step has all accumulated points
+
+        # Fallback to initial points if multistep not available
+        if point_inputs is None and frame_idx in backbone_out.get('point_inputs_per_frame', {}):
+            point_inputs = backbone_out['point_inputs_per_frame'][frame_idx]
+
+        if point_inputs is not None and 'point_coords' in point_inputs:
+            points = point_inputs['point_coords'][0]  # [N, 2]
+            labels = point_inputs['point_labels'][0]  # [N]
+
+            # Check if this is a box input (labels 2 and 3 for the first 2 points)
+            initial_labels = labels[:2].cpu().numpy() if labels.shape[0] >= 2 else labels.cpu().numpy()
+            is_box_input = any(l in [2, 3] for l in initial_labels)
+
+            if is_box_input:
+                # Draw bounding box from first two points (label 2 and 3)
+                box_points = []
+                for i in range(min(2, points.shape[0])):
+                    label = labels[i].item()
+                    if label in [2, 3]:
+                        x, y = int(points[i, 0].item()), int(points[i, 1].item())
+                        box_points.append((x, y, label))
+
+                if len(box_points) >= 2:
+                    # Sort to get top-left and bottom-right
+                    box_points.sort(key=lambda p: p[2])  # sort by label
+                    pt1 = (box_points[0][0], box_points[0][1])  # top-left
+                    pt2 = (box_points[1][0], box_points[1][1])  # bottom-right
+
+                    # Draw rectangle (box)
+                    cv2.rectangle(img_bgr, pt1, pt2, (0, 255, 0), 2)
+                    cv2.rectangle(pred_overlay, pt1, pt2, (0, 255, 0), 2)
+
+                    # Draw corner points
+                    cv2.circle(img_bgr, pt1, 5, (255, 0, 0), -1)  # blue for top-left
+                    cv2.circle(img_bgr, pt2, 5, (255, 0, 255), -1)  # magenta for bottom-right
+                    cv2.circle(pred_overlay, pt1, 5, (255, 0, 0), -1)
+                    cv2.circle(pred_overlay, pt2, 5, (255, 0, 255), -1)
+
+                # Draw correction points (points after the first 2 box corners)
+                if points.shape[0] > 2:
+                    for i in range(2, points.shape[0]):
+                        x, y = int(points[i, 0].item()), int(points[i, 1].item())
+                        label = labels[i].item()
+                        # Positive correction points: green, negative: red
+                        color = (0, 255, 0) if label == 1 else (0, 0, 255)
+                        # Draw with a different style (larger circle with border)
+                        cv2.circle(img_bgr, (x, y), 7, color, 2)  # hollow circle
+                        cv2.circle(pred_overlay, (x, y), 7, color, 2)
+            else:
+                # Draw regular points (no box)
+                for i in range(points.shape[0]):
+                    x, y = int(points[i, 0].item()), int(points[i, 1].item())
+                    label = labels[i].item()
+                    # Positive points (label=1): green circle
+                    # Negative points (label=0): red circle
+                    color = (0, 255, 0) if label == 1 else (0, 0, 255)
+                    # First point: filled circle, correction points: hollow circle
+                    if i == 0:
+                        cv2.circle(img_bgr, (x, y), 5, color, -1)
+                        cv2.circle(pred_overlay, (x, y), 5, color, -1)
+                    else:
+                        cv2.circle(img_bgr, (x, y), 7, color, 2)
+                        cv2.circle(pred_overlay, (x, y), 7, color, 2)
+
+        # Add text labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+
+        # Add point count information
+        point_count_text = ''
+        if point_inputs is not None and 'point_coords' in point_inputs:
+            num_points = point_inputs['point_coords'][0].shape[0]
+            point_count_text = f' ({num_points} points)'
+
+        cv2.putText(img_bgr, f'Input Image{point_count_text}', (10, 30), font, font_scale, (255, 255, 255), thickness)
+        cv2.putText(pred_overlay, 'Prediction', (10, 30), font, font_scale, (255, 255, 255), thickness)
+        cv2.putText(gt_overlay, 'Ground Truth', (10, 30), font, font_scale, (255, 255, 255), thickness)
+
+        combined_image = np.concatenate([img_bgr, pred_overlay, gt_overlay], axis=1)
+
+        # Determine phase based on model training mode
+        phase = "train" if self.training else "val"
+
+        os.makedirs(os.path.join(self.visualize_dir, "visualization_images_with_prompt"), exist_ok=True)
+        save_path = os.path.join(self.visualize_dir, "visualization_images_with_prompt", f'{phase}_iter_{self.iter_count:06d}_basic.jpg')
+        cv2.imwrite(save_path, combined_image)
+        logging.info(f"Basic visualization saved to {save_path}")
+
+    def _visualize_video_sequence(self, input, backbone_out, pred):
+        """
+        Visualize multi-frame video sequence (for video data).
+        Creates a grid layout with all frames showing input, prediction, and ground truth.
+        """
+        num_frames = input.num_frames
+        phase = "train" if self.training else "val"
+
+        # Collect all frames for visualization
+        frames_input = []
+        frames_pred = []
+        frames_gt = []
+
+        for frame_idx in range(num_frames):
+            # Get and denormalize image
+            img = input.flat_img_batch[frame_idx]
             mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
             std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
             img_denorm = img * std + mean
             img_denorm = torch.clamp(img_denorm * 255, 0, 255)
             img_np = img_denorm.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-            img_np = np.ascontiguousarray(img_np)
+            img_bgr = cv2.cvtColor(np.ascontiguousarray(img_np), cv2.COLOR_RGB2BGR)
 
-            # Convert to BGR for OpenCV
-            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-            # Convert prediction mask to uint8
+            # Get prediction mask
+            pred_mask = pred[frame_idx]['pred_masks_high_res'][0, 0]
             pred_mask_np = (torch.sigmoid(pred_mask) > 0.5).float()
             pred_mask_np = (pred_mask_np * 255).cpu().numpy().astype(np.uint8)
 
-            # Convert ground truth mask to uint8
-            gt_mask_np = (gt_mask * 255).cpu().numpy().astype(np.uint8)
+            # Get ground truth mask
+            gt_mask_np = (input.masks[frame_idx][0] * 255).cpu().numpy().astype(np.uint8)
 
-            # Create colored overlays
-            # Green overlay for prediction
-            pred_overlay = img_bgr.copy()
-            pred_mask_colored = cv2.applyColorMap(pred_mask_np, cv2.COLORMAP_JET)
-            pred_overlay = cv2.addWeighted(pred_overlay, 0.6, pred_mask_colored, 0.4, 0)
+            # Create overlays
+            pred_overlay = cv2.addWeighted(
+                img_bgr.copy(), 0.6,
+                cv2.applyColorMap(pred_mask_np, cv2.COLORMAP_JET), 0.4, 0
+            )
+            gt_overlay = cv2.addWeighted(
+                img_bgr.copy(), 0.6,
+                cv2.applyColorMap(gt_mask_np, cv2.COLORMAP_JET), 0.4, 0
+            )
 
-            # Blue overlay for ground truth
-            gt_overlay = img_bgr.copy()
-            gt_mask_colored = cv2.applyColorMap(gt_mask_np, cv2.COLORMAP_JET)
-            gt_overlay = cv2.addWeighted(gt_overlay, 0.6, gt_mask_colored, 0.4, 0)
-
-            # Draw points/box if they exist
-            # Try to get all iterative points from pred first (includes all correction clicks)
-            point_inputs = None
-            if 'multistep_point_inputs' in pred[frame_idx]:
-                # Get the final step's points (which includes all accumulated points)
-                multistep_points = pred[frame_idx]['multistep_point_inputs']
-                if isinstance(multistep_points, list) and len(multistep_points) > 0:
-                    point_inputs = multistep_points[-1]  # Last step has all accumulated points
-
-            # Fallback to initial points if multistep not available
-            if point_inputs is None and frame_idx in backbone_out.get('point_inputs_per_frame', {}):
-                point_inputs = backbone_out['point_inputs_per_frame'][frame_idx]
-
-            if point_inputs is not None and 'point_coords' in point_inputs:
-                points = point_inputs['point_coords'][0]  # [N, 2]
-                labels = point_inputs['point_labels'][0]  # [N]
-
-                # Check if this is a box input (labels 2 and 3 for the first 2 points)
-                initial_labels = labels[:2].cpu().numpy() if labels.shape[0] >= 2 else labels.cpu().numpy()
-                is_box_input = any(l in [2, 3] for l in initial_labels)
-
-                if is_box_input:
-                    # Draw bounding box from first two points (label 2 and 3)
-                    box_points = []
-                    for i in range(min(2, points.shape[0])):
-                        label = labels[i].item()
-                        if label in [2, 3]:
-                            x, y = int(points[i, 0].item()), int(points[i, 1].item())
-                            box_points.append((x, y, label))
-
-                    if len(box_points) >= 2:
-                        # Sort to get top-left and bottom-right
-                        box_points.sort(key=lambda p: p[2])  # sort by label
-                        pt1 = (box_points[0][0], box_points[0][1])  # top-left
-                        pt2 = (box_points[1][0], box_points[1][1])  # bottom-right
-
-                        # Draw rectangle (box)
-                        cv2.rectangle(img_bgr, pt1, pt2, (0, 255, 0), 2)
-                        cv2.rectangle(pred_overlay, pt1, pt2, (0, 255, 0), 2)
-
-                        # Draw corner points
-                        cv2.circle(img_bgr, pt1, 5, (255, 0, 0), -1)  # blue for top-left
-                        cv2.circle(img_bgr, pt2, 5, (255, 0, 255), -1)  # magenta for bottom-right
-                        cv2.circle(pred_overlay, pt1, 5, (255, 0, 0), -1)
-                        cv2.circle(pred_overlay, pt2, 5, (255, 0, 255), -1)
-
-                    # Draw correction points (points after the first 2 box corners)
-                    if points.shape[0] > 2:
-                        for i in range(2, points.shape[0]):
-                            x, y = int(points[i, 0].item()), int(points[i, 1].item())
-                            label = labels[i].item()
-                            # Positive correction points: green, negative: red
-                            color = (0, 255, 0) if label == 1 else (0, 0, 255)
-                            # Draw with a different style (larger circle with border)
-                            cv2.circle(img_bgr, (x, y), 7, color, 2)  # hollow circle
-                            cv2.circle(pred_overlay, (x, y), 7, color, 2)
-                else:
-                    # Draw regular points (no box)
-                    for i in range(points.shape[0]):
-                        x, y = int(points[i, 0].item()), int(points[i, 1].item())
-                        label = labels[i].item()
-                        # Positive points (label=1): green circle
-                        # Negative points (label=0): red circle
-                        color = (0, 255, 0) if label == 1 else (0, 0, 255)
-                        # First point: filled circle, correction points: hollow circle
-                        if i == 0:
-                            cv2.circle(img_bgr, (x, y), 5, color, -1)
-                            cv2.circle(pred_overlay, (x, y), 5, color, -1)
-                        else:
-                            cv2.circle(img_bgr, (x, y), 7, color, 2)
-                            cv2.circle(pred_overlay, (x, y), 7, color, 2)
-
-            # Add text labels
+            # Add frame number labels
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.7
-            thickness = 2
+            cv2.putText(img_bgr, f'Frame {frame_idx}', (10, 30),
+                       font, 0.7, (255, 255, 255), 2)
+            cv2.putText(pred_overlay, f'Pred F{frame_idx}', (10, 30),
+                       font, 0.7, (255, 255, 255), 2)
+            cv2.putText(gt_overlay, f'GT F{frame_idx}', (10, 30),
+                       font, 0.7, (255, 255, 255), 2)
 
-            # Add point count information
-            point_count_text = ''
-            if point_inputs is not None and 'point_coords' in point_inputs:
-                num_points = point_inputs['point_coords'][0].shape[0]
-                point_count_text = f' ({num_points} points)'
+            frames_input.append(img_bgr)
+            frames_pred.append(pred_overlay)
+            frames_gt.append(gt_overlay)
 
-            cv2.putText(img_bgr, f'Input Image{point_count_text}', (10, 30), font, font_scale, (255, 255, 255), thickness)
-            cv2.putText(pred_overlay, 'Prediction', (10, 30), font, font_scale, (255, 255, 255), thickness)
-            cv2.putText(gt_overlay, 'Ground Truth', (10, 30), font, font_scale, (255, 255, 255), thickness)
+        # Concatenate frames horizontally for each row
+        row_input = np.concatenate(frames_input, axis=1)
+        row_pred = np.concatenate(frames_pred, axis=1)
+        row_gt = np.concatenate(frames_gt, axis=1)
 
-            combined_image = np.concatenate([img_bgr, pred_overlay, gt_overlay], axis=1)
+        # Stack rows vertically
+        combined_image = np.concatenate([row_input, row_pred, row_gt], axis=0)
 
-            # Determine phase based on model training mode
-            phase = "train" if self.training else "val"
-
-            os.makedirs(os.path.join(self.visualize_dir, "visualization_images_with_prompt"), exist_ok=True)
-            save_path = os.path.join(self.visualize_dir, "visualization_images_with_prompt", f'{phase}_iter_{self.iter_count:06d}_basic.jpg')
-            cv2.imwrite(save_path, combined_image)
-            logging.info(f"Basic visualization saved to {save_path}")
-            
-
-        except Exception as e:
-            logging.warning(f"Visualization failed: {e}")
+        # Save to separate subdirectory for video sequences
+        save_dir = os.path.join(self.visualize_dir, "visualization_video_sequences")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(
+            save_dir,
+            f'{phase}_iter_{self.iter_count:06d}_video_{num_frames}frames.jpg'
+        )
+        cv2.imwrite(save_path, combined_image)
+        logging.info(f"Video sequence visualization saved to {save_path}")
