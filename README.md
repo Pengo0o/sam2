@@ -34,7 +34,8 @@ SAM 2 needs to be installed first before use. The code requires `python>=3.10`, 
 ```bash
 git clone https://github.com/facebookresearch/sam2.git && cd sam2
 
-pip install -e .
+pip install -e ".[dev]"
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu118
 ```
 If you are installing on Windows, it's strongly recommended to use [Windows Subsystem for Linux (WSL)](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu.
 
@@ -73,6 +74,14 @@ or individually from:
 (note that these are the improved checkpoints denoted as SAM 2.1; see [Model Description](#model-description) for details.)
 
 Then SAM 2 can be used in a few lines as follows for image and video prediction.
+
+### Training
+
+After modifying the dataset paths in the `sam2/configs/sam2.1/sam2.1_hiera_l_hels_finetune+VOS+lora_+new_loss_+boundary_weight+small_area_penalty_numframes.yaml` file, start the following training script.
+
+```shell
+sh scripts/train_0105.sh
+```
 
 ### Image prediction
 
