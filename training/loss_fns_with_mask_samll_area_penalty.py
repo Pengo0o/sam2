@@ -324,6 +324,11 @@ class MultiStepMultiMasksAndIous(nn.Module):
         assert "loss_iou" in self.weight_dict
         if "loss_class" not in self.weight_dict:
             self.weight_dict["loss_class"] = 0.0
+        # Add refine loss weights (use same weights as original branch by default)
+        if "loss_refine_mask" not in self.weight_dict:
+            self.weight_dict["loss_refine_mask"] = self.weight_dict["loss_mask"]
+        if "loss_refine_dice" not in self.weight_dict:
+            self.weight_dict["loss_refine_dice"] = self.weight_dict["loss_dice"]
 
         self.focal_alpha_obj_score = focal_alpha_obj_score
         self.focal_gamma_obj_score = focal_gamma_obj_score
@@ -405,6 +410,18 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 losses, src_masks, target_masks, ious, num_objects, object_score_logits, weight_maps
             )
             loss_weight_masks.append(loss_weight_mask)
+
+        # Add refinement branch loss if refine_masks exist
+        if "refine_masks" in outputs:
+            refine_masks = outputs["refine_masks"]
+            # Initialize refine losses
+            losses["loss_refine_mask"] = 0
+            losses["loss_refine_dice"] = 0
+
+            # Compute refine loss using same loss functions
+            self._compute_refine_losses(
+                losses, refine_masks, target_masks, num_objects, weight_maps
+            )
 
         losses[CORE_LOSS_KEY] = self.reduce_loss(losses)
 
@@ -567,12 +584,134 @@ class MultiStepMultiMasksAndIous(nn.Module):
         # return loss_weight_mask
         return 1-edge_mask
 
+    def _compute_refine_losses(
+        self, losses, refine_masks, target_masks, num_objects, weight_maps=None
+    ):
+        """
+        Compute focal and dice losses for refinement branch masks.
+        Uses the same loss computation as the original branch.
+
+        Args:
+            losses: Dictionary to accumulate losses
+            refine_masks: Refined mask predictions [N, 1, H, W] - now includes residual addition
+            target_masks: Ground truth masks [N, 1, H_gt, W_gt]
+            num_objects: Number of objects in batch
+            weight_maps: Optional pre-computed weight maps [N, 1, H, W]
+        """
+        # Resize target_masks to match refine_masks resolution if needed
+        # This ensures loss computation works regardless of GT resolution
+        if target_masks.shape[-2:] != refine_masks.shape[-2:]:
+            target_masks = F.interpolate(
+                target_masks.float(),
+                size=refine_masks.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+
+        # Create weight masks similar to original branch
+        focal_weight_mask = None
+        dice_weight_mask = None
+
+        if self.focal_edge_weight is not None or self.dice_edge_weight is not None or weight_maps is not None:
+            # Extract edge mask from target masks
+            edge_mask = extract_edge_mask(target_masks, edge_width=self.edge_width)
+
+            # Create focal loss weight mask for refine branch
+            if self.focal_edge_weight is not None or weight_maps is not None:
+                focal_weight_mask = torch.ones_like(target_masks)
+
+                # Apply edge weight to edge regions
+                if self.focal_edge_weight is not None:
+                    focal_weight_mask = torch.where(
+                        edge_mask > 0,
+                        torch.full_like(edge_mask, self.focal_edge_weight),
+                        focal_weight_mask
+                    )
+
+                # Apply pre-computed weight map if provided
+                if weight_maps is not None:
+                    # Resize weight_maps to match target_masks size if needed
+                    if weight_maps.shape != target_masks.shape:
+                        weight_maps_resized = F.interpolate(
+                            weight_maps.float(),
+                            size=target_masks.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                    else:
+                        weight_maps_resized = weight_maps
+
+                    # Apply small area penalty weight
+                    focal_weight_mask = torch.where(
+                        weight_maps_resized > 0,
+                        torch.full_like(weight_maps_resized, self.focal_edge_smallarea_weight),
+                        focal_weight_mask
+                    )
+
+            # Create dice loss weight mask for refine branch
+            if self.dice_edge_weight is not None:
+                dice_weight_mask = torch.ones_like(target_masks)
+                dice_weight_mask = torch.where(
+                    edge_mask > 0,
+                    torch.full_like(edge_mask, self.dice_edge_weight),
+                    dice_weight_mask
+                )
+
+        # Compute focal loss for refine masks
+        # Use loss_on_multimask=True to compute spatial average (not sum) like origin masks
+        # This ensures refine loss has the same scale as origin loss
+        loss_refine_focal_per_mask = sigmoid_focal_loss(
+            refine_masks,
+            target_masks,
+            num_objects,
+            alpha=self.focal_alpha,
+            gamma=self.focal_gamma,
+            loss_on_multimask=True,  # Spatial averaging instead of sum
+            loss_weight_mask=focal_weight_mask,
+        )
+        # loss_refine_focal_per_mask shape: [N, 1]
+
+        # Compute dice loss for refine masks
+        loss_refine_dice_per_mask = dice_loss(
+            refine_masks,
+            target_masks,
+            num_objects,
+            loss_on_multimask=True,  # Spatial averaging instead of sum
+            loss_weight_mask=dice_weight_mask,
+        )
+        # loss_refine_dice_per_mask shape: [N, 1]
+
+        # Check if object is present - FIXED: Match original branch shape [N, 1]
+        # Use [:, 0] for consistency with original branch (even though refine_masks is always [N, 1, H, W])
+        target_obj = torch.any((target_masks[:, 0] > 0).flatten(1), dim=-1)[
+            ..., None
+        ].float()  # Shape: [N, 1]
+
+        # FIXED: Element-wise multiplication then sum (matching original branch)
+        # Only backprop if object is present
+        loss_refine_focal = loss_refine_focal_per_mask * target_obj  # [N, 1] * [N, 1]
+        loss_refine_dice = loss_refine_dice_per_mask * target_obj    # [N, 1] * [N, 1]
+
+        # Sum over batch dimension (note that the losses are already divided by num_objects)
+        losses["loss_refine_mask"] += loss_refine_focal.sum()
+        losses["loss_refine_dice"] += loss_refine_dice.sum()
+
     def reduce_loss(self, losses):
         reduced_loss = 0.0
+        # Define core loss keys that must always exist
+        core_loss_keys = ["loss_mask", "loss_dice", "loss_iou", "loss_class"]
+        # Refine loss keys are optional (only exist when refine_masks are present)
+        optional_loss_keys = ["loss_refine_mask", "loss_refine_dice"]
+
         for loss_key, weight in self.weight_dict.items():
-            if loss_key not in losses:
+            # Check core losses must exist
+            if loss_key in core_loss_keys and loss_key not in losses:
                 raise ValueError(f"{type(self)} doesn't compute {loss_key}")
-            if weight != 0:
+            # Optional refine losses: only add if they exist
+            if loss_key in optional_loss_keys and loss_key not in losses:
+                continue
+            # Add loss if it exists and has non-zero weight
+            if loss_key in losses and weight != 0:
                 reduced_loss += losses[loss_key] * weight
 
         return reduced_loss

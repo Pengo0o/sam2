@@ -399,15 +399,29 @@ class SAM2Train(SAM2Base):
             prev_sam_mask_logits,
         )
 
-        (
-            low_res_multimasks,
-            high_res_multimasks,
-            ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        ) = sam_outputs
+        # Unpack sam_outputs (handles both 7 and 9 element tuples)
+        if len(sam_outputs) == 9:  # With feature fusion
+            (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                upscaled_embedding,
+                refine_tokens_out,
+            ) = sam_outputs
+        else:  # Original SAM2 (7 elements)
+            (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            ) = sam_outputs
 
         current_out["multistep_pred_masks"] = low_res_masks
         current_out["multistep_pred_masks_high_res"] = high_res_masks
@@ -433,15 +447,29 @@ class SAM2Train(SAM2Base):
                 object_score_logits,
                 current_out,
             )
-            (
-                _,
-                _,
-                _,
-                low_res_masks,
-                high_res_masks,
-                obj_ptr,
-                object_score_logits,
-            ) = final_sam_outputs
+            # Unpack final_sam_outputs (handles both 7 and 9 element tuples)
+            if len(final_sam_outputs) == 9:  # With feature fusion
+                (
+                    _,
+                    _,
+                    _,
+                    low_res_masks,
+                    high_res_masks,
+                    obj_ptr,
+                    object_score_logits,
+                    _,  # upscaled_embedding (not used)
+                    _,  # refine_tokens_out (not used)
+                ) = final_sam_outputs
+            else:  # Original SAM2 (7 elements)
+                (
+                    _,
+                    _,
+                    _,
+                    low_res_masks,
+                    high_res_masks,
+                    obj_ptr,
+                    object_score_logits,
+                ) = final_sam_outputs
 
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks
@@ -525,15 +553,29 @@ class SAM2Train(SAM2Base):
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
                 )
-            (
-                low_res_multimasks,
-                high_res_multimasks,
-                ious,
-                low_res_masks,
-                high_res_masks,
-                _,
-                object_score_logits,
-            ) = sam_outputs
+            # Unpack sam_outputs (handles both 7 and 9 element tuples)
+            if len(sam_outputs) == 9:  # With feature fusion
+                (
+                    low_res_multimasks,
+                    high_res_multimasks,
+                    ious,
+                    low_res_masks,
+                    high_res_masks,
+                    _,
+                    object_score_logits,
+                    _,  # upscaled_embedding (not used in iterative correction)
+                    _,  # refine_tokens_out (not used in iterative correction)
+                ) = sam_outputs
+            else:  # Original SAM2 (7 elements)
+                (
+                    low_res_multimasks,
+                    high_res_multimasks,
+                    ious,
+                    low_res_masks,
+                    high_res_masks,
+                    _,
+                    object_score_logits,
+                ) = sam_outputs
             all_pred_masks.append(low_res_masks)
             all_pred_high_res_masks.append(high_res_masks)
             all_pred_multimasks.append(low_res_multimasks)

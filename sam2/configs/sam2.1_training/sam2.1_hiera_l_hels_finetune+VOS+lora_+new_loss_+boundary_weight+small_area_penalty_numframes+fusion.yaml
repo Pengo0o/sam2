@@ -4,7 +4,7 @@ scratch:
   resolution: 1024
   train_batch_size: 1
   num_train_workers: 10
-  num_frames: 15
+  num_frames: 3
   max_num_objects: 3
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
@@ -194,6 +194,10 @@ trainer:
     # Compilation flag
     # compile_image_encoder: False
 
+    # Feature fusion refinement branch
+    use_feature_fusion: true
+    num_refine_tokens: 1
+
     ####### Training specific params #######
     # box/point input and corrections
     # prob_to_use_pt_input_for_train: 0.5
@@ -373,7 +377,6 @@ trainer:
       strict: True
       ignore_unexpected_keys: null
       # Ignore missing keys for new feature fusion modules (not in pretrained checkpoint)
-      # These will only exist if use_feature_fusion=true
       ignore_missing_keys:
         - 'feature_fusion.*'
         - 'prototype_extractor.*'
@@ -389,7 +392,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: output_0105_sam2.1_hiera_l_hels_finetune+VOS+lora_+new_loss_+boundary_weight+small_area_penalty # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: output_sam2.1_hiera_l_hels_finetune+VOS+lora_+new_loss_+boundary_weight+small_area_penalty+fusion # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

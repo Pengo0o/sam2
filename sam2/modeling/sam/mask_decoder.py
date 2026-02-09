@@ -30,6 +30,9 @@ class MaskDecoder(nn.Module):
         pred_obj_scores: bool = False,
         pred_obj_scores_mlp: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
+        # Feature fusion refinement parameters
+        use_refine_tokens: bool = False,
+        num_refine_tokens: int = 8,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -107,6 +110,15 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_stability_delta = dynamic_multimask_stability_delta
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
 
+        # Refinement tokens for dual-branch architecture
+        self.use_refine_tokens = use_refine_tokens
+        if self.use_refine_tokens:
+            self.num_refine_tokens = num_refine_tokens
+            self.refine_tokens = nn.Embedding(num_refine_tokens, transformer_dim)
+            from torch.nn.init import trunc_normal_
+
+            trunc_normal_(self.refine_tokens.weight, std=0.02)
+
     def forward(
         self,
         image_embeddings: torch.Tensor,
@@ -133,7 +145,7 @@ class MaskDecoder(nn.Module):
           torch.Tensor: batched predictions of mask quality
           torch.Tensor: batched SAM token for mask output
         """
-        masks, iou_pred, mask_tokens_out, object_score_logits = self.predict_masks(
+        predict_outputs = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
@@ -141,6 +153,14 @@ class MaskDecoder(nn.Module):
             repeat_image=repeat_image,
             high_res_features=high_res_features,
         )
+
+        # Handle variable-length return from predict_masks
+        if self.use_refine_tokens:
+            masks, iou_pred, mask_tokens_out, object_score_logits, upscaled_embedding, refine_tokens_out = predict_outputs
+        else:
+            masks, iou_pred, mask_tokens_out, object_score_logits = predict_outputs
+            upscaled_embedding = None
+            refine_tokens_out = None
 
         # Select the correct mask or masks for output
         if multimask_output:
@@ -163,7 +183,10 @@ class MaskDecoder(nn.Module):
             sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
 
         # Prepare output
-        return masks, iou_pred, sam_tokens_out, object_score_logits
+        if self.use_refine_tokens:
+            return masks, iou_pred, sam_tokens_out, object_score_logits, upscaled_embedding, refine_tokens_out
+        else:
+            return masks, iou_pred, sam_tokens_out, object_score_logits
 
     def predict_masks(
         self,
@@ -191,6 +214,15 @@ class MaskDecoder(nn.Module):
             output_tokens = torch.cat(
                 [self.iou_token.weight, self.mask_tokens.weight], dim=0
             )
+
+        # Add refine tokens if enabled
+        if self.use_refine_tokens:
+            refine_token_embeds = self.refine_tokens.weight
+            output_tokens = torch.cat([output_tokens, refine_token_embeds], dim=0)
+            num_refine_tokens = refine_token_embeds.size(0)
+        else:
+            num_refine_tokens = 0
+
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
         )
@@ -213,6 +245,14 @@ class MaskDecoder(nn.Module):
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
+
+        # Extract refine token outputs if enabled
+        if self.use_refine_tokens:
+            refine_tokens_out = hs[
+                :, s + 1 + self.num_mask_tokens : s + 1 + self.num_mask_tokens + num_refine_tokens, :
+            ]
+        else:
+            refine_tokens_out = None
 
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
@@ -242,7 +282,18 @@ class MaskDecoder(nn.Module):
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
-        return masks, iou_pred, mask_tokens_out, object_score_logits
+        # Return upscaled_embedding and refine_tokens_out for refinement branch
+        if self.use_refine_tokens:
+            return (
+                masks,
+                iou_pred,
+                mask_tokens_out,
+                object_score_logits,
+                upscaled_embedding,
+                refine_tokens_out,
+            )
+        else:
+            return masks, iou_pred, mask_tokens_out, object_score_logits
 
     def _get_stability_scores(self, mask_logits):
         """

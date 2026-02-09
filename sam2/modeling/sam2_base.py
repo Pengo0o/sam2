@@ -93,6 +93,9 @@ class SAM2Base(torch.nn.Module):
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
+        # Feature fusion refinement branch parameters
+        use_feature_fusion: bool = False,
+        num_refine_tokens: int = 8,
     ):
         super().__init__()
 
@@ -178,8 +181,53 @@ class SAM2Base(torch.nn.Module):
             self.no_obj_embed_spatial = torch.nn.Parameter(torch.zeros(1, self.mem_dim))
             trunc_normal_(self.no_obj_embed_spatial, std=0.02)
 
+        # Feature fusion refinement branch (set before _build_sam_heads)
+        self.use_feature_fusion = use_feature_fusion
+        self.num_refine_tokens = num_refine_tokens
+
         self._build_sam_heads()
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
+
+        # Build feature fusion components after SAM heads
+        if self.use_feature_fusion:
+            from sam2.modeling.feature_fusion import (
+                FeatureFusion,
+                PrototypeExtractor,
+                PrototypeConditioningModule,
+                MaskRefinementHead,
+            )
+
+            # All feature fusion components use hidden_dim // 8 = 32
+            fusion_dim = self.hidden_dim // 8
+
+            self.feature_fusion = FeatureFusion(
+                input_dim_layer0=self.hidden_dim // 8,
+                input_dim_layer1=self.hidden_dim // 4,
+                hidden_dim=self.hidden_dim,  # 256
+            )
+
+            self.prototype_extractor = PrototypeExtractor(
+                num_prototypes=5,
+                feature_dim=fusion_dim,  # 32
+                num_heads=1,
+            )
+
+            self.prototype_conditioning = PrototypeConditioningModule(
+                input_dim=fusion_dim + 1,  # 33 (32 + 1 mask channel)
+                output_dim=fusion_dim,  # 32
+                num_heads=1,
+            )
+
+            self.mask_refinement_head = MaskRefinementHead(
+                hidden_dim=fusion_dim,  # 32
+                transformer_dim=self.sam_prompt_embed_dim,  # 256
+                num_refine_tokens=num_refine_tokens,
+            )
+
+            # Temporary cache for prototypes (only keep the most recent frame per object)
+            # This avoids accumulating prototypes in output_dict for long videos
+            # Key: (obj_idx, frame_idx), Value: prototypes tensor
+            self._prototypes_cache = {}
 
         # Model compilation
         if compile_image_encoder:
@@ -203,6 +251,11 @@ class SAM2Base(torch.nn.Module):
             "Please use the corresponding methods in SAM2VideoPredictor for inference or SAM2Train for training/fine-tuning"
             "See notebooks/video_predictor_example.ipynb for an inference example."
         )
+
+    def clear_prototypes_cache(self):
+        """Clear the prototypes cache to free memory. Call this when switching to a new video."""
+        if self.use_feature_fusion and hasattr(self, "_prototypes_cache"):
+            self._prototypes_cache.clear()
 
     def _build_sam_heads(self):
         """Build SAM-style prompt encoder and mask decoder."""
@@ -236,6 +289,8 @@ class SAM2Base(torch.nn.Module):
             pred_obj_scores=self.pred_obj_scores,
             pred_obj_scores_mlp=self.pred_obj_scores_mlp,
             use_multimask_token_for_obj_ptr=self.use_multimask_token_for_obj_ptr,
+            use_refine_tokens=self.use_feature_fusion,  # Enable refine tokens when feature fusion is enabled
+            num_refine_tokens=self.num_refine_tokens if self.use_feature_fusion else 8,
             **(self.sam_mask_decoder_extra_args or {}),
         )
         if self.use_obj_ptrs_in_encoder:
@@ -342,12 +397,7 @@ class SAM2Base(torch.nn.Module):
             boxes=None,
             masks=sam_mask_prompt,
         )
-        (
-            low_res_multimasks,
-            ious,
-            sam_output_tokens,
-            object_score_logits,
-        ) = self.sam_mask_decoder(
+        decoder_outputs = self.sam_mask_decoder(
             image_embeddings=backbone_features,
             image_pe=self.sam_prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
@@ -356,6 +406,26 @@ class SAM2Base(torch.nn.Module):
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
         )
+
+        # Unpack decoder outputs (handles both 4 and 6 element tuples)
+        if len(decoder_outputs) == 6:  # With feature fusion (refine tokens enabled)
+            (
+                low_res_multimasks,
+                ious,
+                sam_output_tokens,
+                object_score_logits,
+                upscaled_embedding,
+                refine_tokens_out,
+            ) = decoder_outputs
+        else:  # Original SAM2 (4 elements)
+            (
+                low_res_multimasks,
+                ious,
+                sam_output_tokens,
+                object_score_logits,
+            ) = decoder_outputs
+            upscaled_embedding = None
+            refine_tokens_out = None
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
 
@@ -402,15 +472,29 @@ class SAM2Base(torch.nn.Module):
                 obj_ptr = lambda_is_obj_appearing * obj_ptr
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
-        return (
-            low_res_multimasks,
-            high_res_multimasks,
-            ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        )
+        # Return tuple (7 or 9 elements depending on feature fusion)
+        if upscaled_embedding is not None and refine_tokens_out is not None:
+            return (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                upscaled_embedding,
+                refine_tokens_out,
+            )
+        else:
+            return (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            )
 
     def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
         """
@@ -748,6 +832,34 @@ class SAM2Base(torch.nn.Module):
             ]
         else:
             high_res_features = None
+
+        # Feature fusion preprocessing
+        if self.use_feature_fusion and high_res_features is not None:
+            # Fuse encoder layer 0 and layer 1 features
+            fused_encoder_features = self.feature_fusion(
+                high_res_features[0], high_res_features[1]
+            )  # [B, 32, H, W]
+
+            # Extract prototypes from current frame
+            current_prototypes = self.prototype_extractor(
+                fused_encoder_features
+            )  # [B, 5, 32]
+            # Store in temporary cache instead of output_dict to save memory
+            # We only need the most recent prototype for next frame
+            # Note: In training, obj_idx info is not available here, use frame_idx as key
+            cache_key = frame_idx
+            self._prototypes_cache[cache_key] = current_prototypes.detach()
+
+            # Clean up old prototypes to prevent memory accumulation
+            # Only keep prototypes from recent frames (last 10 frames)
+            max_cache_size = 10
+            if len(self._prototypes_cache) > max_cache_size:
+                # Remove oldest frames
+                sorted_keys = sorted(self._prototypes_cache.keys())
+                for old_key in sorted_keys[:-max_cache_size]:
+                    del self._prototypes_cache[old_key]
+        else:
+            fused_encoder_features = None
         if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
             # When use_mask_input_as_output_without_sam=True, we directly output the mask input
             # (see it as a GT mask) without using a SAM prompt encoder + mask decoder.
@@ -783,6 +895,88 @@ class SAM2Base(torch.nn.Module):
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
             )
+
+        # Refinement branch (dual-branch architecture)
+        if self.use_feature_fusion and fused_encoder_features is not None:
+            # Unpack sam_outputs to get masks and decoder outputs
+            # Check if decoder returned extra outputs (upscaled_embedding, refine_tokens_out)
+            if len(sam_outputs) == 9:  # With feature fusion enabled
+                low_res_masks = sam_outputs[3]
+                upscaled_embedding = sam_outputs[7]
+                refine_tokens_out = sam_outputs[8]
+
+                # Concatenate fused features with current frame masks
+                mask_logits_resized = F.interpolate(
+                    low_res_masks,
+                    size=fused_encoder_features.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                combined_features = torch.cat(
+                    [fused_encoder_features, mask_logits_resized], dim=1
+                )  # [B, 33, H, W]
+
+                # Get previous prototypes from cache
+                prev_prototypes = None
+                if not is_init_cond_frame and frame_idx > 0:
+                    # Try to get from cache (memory-efficient)
+                    prev_cache_key = frame_idx - 1
+                    prev_prototypes = self._prototypes_cache.get(prev_cache_key, None)
+
+                # Cross-attention conditioning with previous prototypes
+                if prev_prototypes is not None:
+                    cross_attn_result = self.prototype_conditioning(
+                        combined_features, prev_prototypes
+                    )
+                else:
+                    # First frame: no conditioning
+                    cross_attn_result = torch.zeros(
+                        combined_features.size(0),
+                        fused_encoder_features.size(1),  # 32
+                        combined_features.size(2),
+                        combined_features.size(3),
+                        device=combined_features.device,
+                        dtype=combined_features.dtype,
+                    )
+
+                # Generate refined masks using hypernetwork approach
+                refine_masks = self.mask_refinement_head(
+                    cross_attn_result, upscaled_embedding, refine_tokens_out
+                )  # [B, 1, 256, 256] at upscaled_embedding resolution
+
+                # Get origin high-res masks for residual connection
+                high_res_masks = sam_outputs[4]  # [B, 1 or M, 256, 256]
+
+                # Ensure high_res_masks is single-channel [B, 1, H, W]
+                # If multimask output wasn't processed, select the best mask based on IoU
+                if high_res_masks.shape[1] > 1:
+                    ious = sam_outputs[2]  # [B, M]
+                    best_iou_inds = torch.argmax(ious, dim=-1)
+                    batch_inds = torch.arange(high_res_masks.shape[0], device=high_res_masks.device)
+                    high_res_masks_single = high_res_masks[batch_inds, best_iou_inds].unsqueeze(1)  # [B, 1, H, W]
+                else:
+                    high_res_masks_single = high_res_masks  # Already [B, 1, H, W]
+
+                # Check if resolutions match; upscale if needed
+                if refine_masks.shape[-2:] != high_res_masks_single.shape[-2:]:
+                    refine_masks_upscaled = F.interpolate(
+                        refine_masks,
+                        size=high_res_masks_single.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                else:
+                    refine_masks_upscaled = refine_masks
+
+                # Residual addition: final refined mask = origin + refinement delta
+                # The refinement branch learns corrections/adjustments to the origin prediction
+                final_refined_mask = high_res_masks_single + refine_masks_upscaled
+
+                # Store final refined mask (this is what gets supervised)
+                current_out["refine_masks"] = final_refined_mask
+
+                # Optionally store the delta for visualization/analysis
+                current_out["refine_masks_delta"] = refine_masks_upscaled
 
         return current_out, sam_outputs, high_res_features, pix_feat
 
@@ -846,15 +1040,29 @@ class SAM2Base(torch.nn.Module):
             prev_sam_mask_logits,
         )
 
-        (
-            _,
-            _,
-            _,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        ) = sam_outputs
+        # Unpack sam_outputs (handles both 7 and 9 element tuples)
+        if len(sam_outputs) == 9:  # With feature fusion
+            (
+                _,
+                _,
+                _,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                upscaled_embedding,
+                refine_tokens_out,
+            ) = sam_outputs
+        else:  # Original SAM2 (7 elements)
+            (
+                _,
+                _,
+                _,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            ) = sam_outputs
 
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
@@ -863,6 +1071,9 @@ class SAM2Base(torch.nn.Module):
             # Only add this in inference (to avoid unused param in activation checkpointing;
             # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
             current_out["object_score_logits"] = object_score_logits
+
+        # Note: refine_masks are already in current_out if feature fusion is enabled
+        # (added by _track_step method)
 
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)
