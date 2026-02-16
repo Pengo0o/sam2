@@ -314,19 +314,20 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
         # accumulate the loss over prediction steps
         losses = {"loss_mask": 0, "loss_dice": 0, "loss_iou": 0, "loss_class": 0}
-        loss_weight_masks = []  # Store loss weight masks for visualization
+        last_loss_weight_mask = None  # Store only the last loss weight mask for visualization
         for src_masks, ious, object_score_logits in zip(
             src_masks_list, ious_list, object_score_logits_list
         ):
             loss_weight_mask = self._update_losses(
                 losses, src_masks, target_masks, ious, num_objects, object_score_logits
             )
-            loss_weight_masks.append(loss_weight_mask)
+            last_loss_weight_mask = loss_weight_mask  # Keep only the last one
 
         losses[CORE_LOSS_KEY] = self.reduce_loss(losses)
 
-        # Store loss_weight_masks in outputs for visualization
-        outputs["loss_weight_masks"] = loss_weight_masks
+        # Store only the last loss_weight_mask in outputs for visualization
+        # Using a list with single element to maintain compatibility with visualization code
+        outputs["loss_weight_masks"] = [last_loss_weight_mask] if last_loss_weight_mask is not None else []
 
         return losses
 

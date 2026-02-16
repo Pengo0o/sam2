@@ -291,7 +291,7 @@ class BoneRawDataset(VOSRawDataset):
         else:
             subset = os.listdir(self.img_folder)
             subset = [
-                path.split(".")[0] for path in subset if path.endswith(".png")
+                path.split(".")[0] for path in subset if path.endswith((".png", ".jpg", ".jpeg"))
             ]  # remove extension
 
         # Read and process excluded files if provided
@@ -312,7 +312,17 @@ class BoneRawDataset(VOSRawDataset):
         """
         video_name = self.video_names[idx]
 
-        video_frame_path = os.path.join(self.img_folder, video_name + ".png")
+        # Try to find the image file with different extensions
+        video_frame_path = None
+        for ext in [".jpg", ".jpeg", ".png"]:
+            candidate = os.path.join(self.img_folder, video_name + ext)
+            if os.path.exists(candidate):
+                video_frame_path = candidate
+                break
+        if video_frame_path is None:
+            raise FileNotFoundError(
+                f"Image file for {video_name} not found under {self.img_folder} (tried .jpg, .jpeg, .png)"
+            )
         mask_path = None
         for ext in [".png"]:
             candidate = os.path.join(self.gt_folder, video_name + ext)

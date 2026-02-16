@@ -215,6 +215,10 @@ class Trainer:
         self._setup_dataloaders()
 
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
+        
+        # Cache normalization tensors to avoid repeated creation during visualization
+        self._mean_tensor = None
+        self._std_tensor = None
 
         if self.checkpoint_conf.resume_from is not None:
             assert os.path.exists(
@@ -510,6 +514,12 @@ class Trainer:
 
         self._maybe_visualize_loss_masks(batch, outputs, phase)
 
+        # Clean up loss_weight_masks from outputs to prevent memory leak on rank 0
+        # (visualization is only done on rank 0, so it has extra memory usage)
+        for output in outputs:
+            if "loss_weight_masks" in output:
+                del output["loss_weight_masks"]
+
         if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
             self.logger.log(
                 loss_log_str,
@@ -573,9 +583,11 @@ class Trainer:
             gt_masks = batch.masks[0][0].detach().float()
             img = batch.flat_img_batch[0].detach()
 
-            mean = img.new_tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            std = img.new_tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            img_denorm = torch.clamp((img * std + mean) * 255, 0, 255)
+            # Use cached normalization tensors to avoid repeated creation
+            if self._mean_tensor is None or self._mean_tensor.device != img.device:
+                self._mean_tensor = img.new_tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                self._std_tensor = img.new_tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            img_denorm = torch.clamp((img * self._std_tensor + self._mean_tensor) * 255, 0, 255)
             img_np = img_denorm.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
             img_bgr = cv2.cvtColor(np.ascontiguousarray(img_np), cv2.COLOR_RGB2BGR)
 
@@ -674,8 +686,20 @@ class Trainer:
             )
             cv2.imwrite(save_path, combined_loss_vis)
             logging.info("Loss mask visualization saved to %s", save_path)
+
+            # Clean up temporary variables to free memory
+            del loss_weight_tensor, pred_mask, gt_masks, img
+            del img_np, img_bgr, pred_mask_np, gt_mask_np
+            del pred_overlay, gt_overlay, edge_mask_binary, edge_mask_3ch
+            del img_with_edge, pred_with_edge, gt_with_edge, combined_loss_vis
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         except Exception as exc:  # pylint: disable=broad-except
             logging.warning("Loss mask visualization failed: %s", exc)
+            # Clean up on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def run(self):
         assert self.mode in ["train", "train_only", "val"]

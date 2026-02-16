@@ -80,6 +80,9 @@ class SAM2Train(SAM2Base):
         self.visualize_interval = visualize_interval
         self.visualize_dir = visualize_dir
         self.iter_count = 0
+        # Cache normalization tensors to avoid repeated creation
+        self._mean_tensor = None
+        self._std_tensor = None
 
         # Point sampler and conditioning frames
         self.prob_to_use_pt_input_for_train = prob_to_use_pt_input_for_train
@@ -599,10 +602,11 @@ class SAM2Train(SAM2Base):
         # Get ground truth mask
         gt_mask = input.masks[frame_idx][0]  # Shape: [H, W]
 
-        # Denormalize image (ImageNet normalization)
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
-        img_denorm = img * std + mean
+        # Denormalize image (ImageNet normalization) - use cached tensors
+        if self._mean_tensor is None or self._mean_tensor.device != img.device:
+            self._mean_tensor = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
+            self._std_tensor = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
+        img_denorm = img * self._std_tensor + self._mean_tensor
         img_denorm = torch.clamp(img_denorm * 255, 0, 255)
         img_np = img_denorm.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
         img_np = np.ascontiguousarray(img_np)
@@ -725,6 +729,13 @@ class SAM2Train(SAM2Base):
         cv2.imwrite(save_path, combined_image)
         logging.info(f"Basic visualization saved to {save_path}")
 
+        # Clean up temporary variables to prevent memory leak
+        del img, pred_mask, gt_mask
+        del img_np, img_bgr, pred_mask_np, gt_mask_np
+        del pred_overlay, gt_overlay, combined_image
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _visualize_video_sequence(self, input, backbone_out, pred):
         """
         Visualize multi-frame video sequence (for video data).
@@ -733,66 +744,99 @@ class SAM2Train(SAM2Base):
         num_frames = input.num_frames
         phase = "train" if self.training else "val"
 
-        # Collect all frames for visualization
-        frames_input = []
-        frames_pred = []
-        frames_gt = []
+        # Process frames one at a time and immediately save to reduce memory
+        try:
+            # Initialize lists to hold processed frames
+            frames_input = []
+            frames_pred = []
+            frames_gt = []
 
-        for frame_idx in range(num_frames):
-            # Get and denormalize image
-            img = input.flat_img_batch[frame_idx]
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
-            img_denorm = img * std + mean
-            img_denorm = torch.clamp(img_denorm * 255, 0, 255)
-            img_np = img_denorm.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-            img_bgr = cv2.cvtColor(np.ascontiguousarray(img_np), cv2.COLOR_RGB2BGR)
+            # Use cached normalization tensors
+            device = input.flat_img_batch.device
+            if self._mean_tensor is None or self._mean_tensor.device != device:
+                self._mean_tensor = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(device)
+                self._std_tensor = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
 
-            # Get prediction mask
-            pred_mask = pred[frame_idx]['pred_masks_high_res'][0, 0]
-            pred_mask_np = (torch.sigmoid(pred_mask) > 0.5).float()
-            pred_mask_np = (pred_mask_np * 255).cpu().numpy().astype(np.uint8)
+            for frame_idx in range(num_frames):
+                # Get and denormalize image
+                img = input.flat_img_batch[frame_idx]
+                img_denorm = img * self._std_tensor + self._mean_tensor
+                img_denorm = torch.clamp(img_denorm * 255, 0, 255)
+                img_np = img_denorm.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+                img_bgr = cv2.cvtColor(np.ascontiguousarray(img_np), cv2.COLOR_RGB2BGR)
 
-            # Get ground truth mask
-            gt_mask_np = (input.masks[frame_idx][0] * 255).cpu().numpy().astype(np.uint8)
+                # Get prediction mask
+                pred_mask = pred[frame_idx]['pred_masks_high_res'][0, 0]
+                pred_mask_np = (torch.sigmoid(pred_mask) > 0.5).float()
+                pred_mask_np = (pred_mask_np * 255).cpu().numpy().astype(np.uint8)
 
-            # Create overlays
-            pred_overlay = cv2.addWeighted(
-                img_bgr.copy(), 0.6,
-                cv2.applyColorMap(pred_mask_np, cv2.COLORMAP_JET), 0.4, 0
+                # Get ground truth mask
+                gt_mask_np = (input.masks[frame_idx][0] * 255).cpu().numpy().astype(np.uint8)
+
+                # Create overlays
+                pred_overlay = cv2.addWeighted(
+                    img_bgr.copy(), 0.6,
+                    cv2.applyColorMap(pred_mask_np, cv2.COLORMAP_JET), 0.4, 0
+                )
+                gt_overlay = cv2.addWeighted(
+                    img_bgr.copy(), 0.6,
+                    cv2.applyColorMap(gt_mask_np, cv2.COLORMAP_JET), 0.4, 0
+                )
+
+                # Add frame number labels
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(img_bgr, f'Frame {frame_idx}', (10, 30),
+                           font, 0.7, (255, 255, 255), 2)
+                cv2.putText(pred_overlay, f'Pred F{frame_idx}', (10, 30),
+                           font, 0.7, (255, 255, 255), 2)
+                cv2.putText(gt_overlay, f'GT F{frame_idx}', (10, 30),
+                           font, 0.7, (255, 255, 255), 2)
+
+                frames_input.append(img_bgr)
+                frames_pred.append(pred_overlay)
+                frames_gt.append(gt_overlay)
+
+                # Explicitly delete intermediate arrays to free memory
+                del img_np, pred_mask_np, gt_mask_np
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # Concatenate frames horizontally for each row
+            row_input = np.concatenate(frames_input, axis=1)
+            row_pred = np.concatenate(frames_pred, axis=1)
+            row_gt = np.concatenate(frames_gt, axis=1)
+
+            # Clear frame lists to free memory before concatenation
+            del frames_input, frames_pred, frames_gt
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Stack rows vertically
+            combined_image = np.concatenate([row_input, row_pred, row_gt], axis=0)
+
+            # Save to separate subdirectory for video sequences
+            save_dir = os.path.join(self.visualize_dir, "visualization_video_sequences")
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(
+                save_dir,
+                f'{phase}_iter_{self.iter_count:06d}_video_{num_frames}frames.jpg'
             )
-            gt_overlay = cv2.addWeighted(
-                img_bgr.copy(), 0.6,
-                cv2.applyColorMap(gt_mask_np, cv2.COLORMAP_JET), 0.4, 0
-            )
+            cv2.imwrite(save_path, combined_image)
+            logging.info(f"Video sequence visualization saved to {save_path}")
 
-            # Add frame number labels
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(img_bgr, f'Frame {frame_idx}', (10, 30),
-                       font, 0.7, (255, 255, 255), 2)
-            cv2.putText(pred_overlay, f'Pred F{frame_idx}', (10, 30),
-                       font, 0.7, (255, 255, 255), 2)
-            cv2.putText(gt_overlay, f'GT F{frame_idx}', (10, 30),
-                       font, 0.7, (255, 255, 255), 2)
+            # Clean up final arrays
+            del row_input, row_pred, row_gt, combined_image
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            frames_input.append(img_bgr)
-            frames_pred.append(pred_overlay)
-            frames_gt.append(gt_overlay)
-
-        # Concatenate frames horizontally for each row
-        row_input = np.concatenate(frames_input, axis=1)
-        row_pred = np.concatenate(frames_pred, axis=1)
-        row_gt = np.concatenate(frames_gt, axis=1)
-
-        # Stack rows vertically
-        combined_image = np.concatenate([row_input, row_pred, row_gt], axis=0)
-
-        # Save to separate subdirectory for video sequences
-        save_dir = os.path.join(self.visualize_dir, "visualization_video_sequences")
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(
-            save_dir,
-            f'{phase}_iter_{self.iter_count:06d}_video_{num_frames}frames.jpg'
-        )
-        cv2.imwrite(save_path, combined_image)
-        logging.info(f"Video sequence visualization saved to {save_path}")
+        except Exception as e:
+            logging.warning(f"Video visualization failed: {e}")
+            # Clean up on error
+            if 'frames_input' in locals():
+                del frames_input
+            if 'frames_pred' in locals():
+                del frames_pred
+            if 'frames_gt' in locals():
+                del frames_gt
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
