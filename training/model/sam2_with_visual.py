@@ -70,6 +70,8 @@ class SAM2Train(SAM2Base):
         # Visualization parameters
         visualize_interval=100,  # Visualize every N iterations
         visualize_dir="visualization_output",  # Directory to save visualizations
+        # Non-interactive mode: no prompts for images, first-frame prediction as prompt for videos
+        non_interactive_mode=False,
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
@@ -83,6 +85,9 @@ class SAM2Train(SAM2Base):
         # Cache normalization tensors to avoid repeated creation
         self._mean_tensor = None
         self._std_tensor = None
+
+        # Non-interactive mode setting
+        self.non_interactive_mode = non_interactive_mode
 
         # Point sampler and conditioning frames
         self.prob_to_use_pt_input_for_train = prob_to_use_pt_input_for_train
@@ -181,6 +186,25 @@ class SAM2Train(SAM2Base):
         backbone_out["gt_masks_per_frame"] = gt_masks_per_frame
         num_frames = input.num_frames
         backbone_out["num_frames"] = num_frames
+
+        # Non-interactive mode: no prompts for images, first-frame prediction as prompt for videos
+        if self.non_interactive_mode:
+            is_image = (num_frames == 1)
+            backbone_out["use_pt_input"] = False
+            backbone_out["init_cond_frames"] = [start_frame_idx]
+            backbone_out["mask_inputs_per_frame"] = {}
+            backbone_out["point_inputs_per_frame"] = {}
+            backbone_out["frames_to_add_correction_pt"] = []
+
+            if is_image:
+                # Image: no prompts, no other frames
+                backbone_out["frames_not_in_init_cond"] = []
+            else:
+                # Video: first frame no prompts, subsequent frames tracked
+                backbone_out["frames_not_in_init_cond"] = list(range(start_frame_idx + 1, num_frames))
+                backbone_out["use_first_frame_pred_for_tracking"] = True
+
+            return backbone_out
 
         # Randomly decide whether to use point inputs or mask inputs
         if self.training:
@@ -311,6 +335,11 @@ class SAM2Train(SAM2Base):
             "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
             "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
         }
+
+        # Non-interactive mode: track first frame prediction for video
+        first_frame_pred_mask = None
+        use_first_frame_pred = backbone_out.get("use_first_frame_pred_for_tracking", False)
+
         for stage_id in processing_order:
             # Get the image features for the current frames
             # img_ids = input.find_inputs[stage_id].img_ids
@@ -332,19 +361,34 @@ class SAM2Train(SAM2Base):
                 )
 
             # Get output masks based on this frame's prompts and previous memory
+            # Non-interactive mode: use first frame prediction as mask prompt for subsequent frames
+            current_point_inputs = backbone_out["point_inputs_per_frame"].get(stage_id, None)
+            current_mask_inputs = backbone_out["mask_inputs_per_frame"].get(stage_id, None)
+
+            if use_first_frame_pred and stage_id > 0:
+                # Use first frame's prediction as mask prompt for subsequent frames
+                if first_frame_pred_mask is not None:
+                    current_mask_inputs = first_frame_pred_mask
+                    current_point_inputs = None
+
             current_out = self.track_step(
                 frame_idx=stage_id,
                 is_init_cond_frame=stage_id in init_cond_frames,
                 current_vision_feats=current_vision_feats,
                 current_vision_pos_embeds=current_vision_pos_embeds,
                 feat_sizes=feat_sizes,
-                point_inputs=backbone_out["point_inputs_per_frame"].get(stage_id, None),
-                mask_inputs=backbone_out["mask_inputs_per_frame"].get(stage_id, None),
+                point_inputs=current_point_inputs,
+                mask_inputs=current_mask_inputs,
                 gt_masks=backbone_out["gt_masks_per_frame"].get(stage_id, None),
                 frames_to_add_correction_pt=frames_to_add_correction_pt,
                 output_dict=output_dict,
                 num_frames=num_frames,
             )
+
+            # Non-interactive mode: save first frame's prediction for subsequent frames
+            if use_first_frame_pred and stage_id == 0:
+                first_frame_pred_mask = current_out["pred_masks_high_res"].detach()
+
             # Append the output, depending on whether it's a conditioning frame
             add_output_as_cond_frame = stage_id in init_cond_frames or (
                 self.add_all_frames_to_correct_as_cond
@@ -708,6 +752,11 @@ class SAM2Train(SAM2Base):
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.7
         thickness = 2
+
+        # Add mode indicator
+        mode_text = "Non-Interactive" if self.non_interactive_mode else "Interactive"
+        cv2.putText(img_bgr, mode_text, (10, 60), font, 0.5, (0, 255, 255), 1)
+        cv2.putText(pred_overlay, mode_text, (10, 60), font, 0.5, (0, 255, 255), 1)
 
         # Add point count information
         point_count_text = ''
