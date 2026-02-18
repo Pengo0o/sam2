@@ -72,6 +72,10 @@ class SAM2Train(SAM2Base):
         visualize_dir="visualization_output",  # Directory to save visualizations
         # Non-interactive mode: no prompts for images, first-frame prediction as prompt for videos
         non_interactive_mode=False,
+        # Fusion training: tri-path (forward / backward / image) fusion at the target frame.
+        # Requires the data sampler to provide 2*fusion_window_size+1 frames centered on target.
+        fusion_training=False,
+        fusion_window_size=6,
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
@@ -88,6 +92,10 @@ class SAM2Train(SAM2Base):
 
         # Non-interactive mode setting
         self.non_interactive_mode = non_interactive_mode
+
+        # Fusion training setting
+        self.fusion_training = fusion_training
+        self.fusion_window_size = fusion_window_size
 
         # Point sampler and conditioning frames
         self.prob_to_use_pt_input_for_train = prob_to_use_pt_input_for_train
@@ -129,7 +137,10 @@ class SAM2Train(SAM2Base):
             # defer image feature computation on a frame until it's being tracked
             backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}
         backbone_out = self.prepare_prompt_inputs(backbone_out, input)
-        previous_stages_out = self.forward_tracking(backbone_out, input)
+        if self.fusion_training and self.training and backbone_out["num_frames"] > 1:
+            previous_stages_out = self.forward_tracking_with_fusion(backbone_out, input)
+        else:
+            previous_stages_out = self.forward_tracking(backbone_out, input)
 
         # Visualization (only on rank 0 to avoid duplicate outputs in distributed training)
         if torch.distributed.is_initialized():
@@ -412,6 +423,188 @@ class SAM2Train(SAM2Base):
         ]
 
         return all_frame_outputs
+
+    # ------------------------------------------------------------------
+    # Tri-path fusion helpers
+    # ------------------------------------------------------------------
+
+    def _run_window_non_interactive(
+        self, frame_order, vision_feats, vision_pos_embeds, feat_sizes, input
+    ):
+        """Run non-interactive tracking on a subsequence of frames.
+
+        Replicates the non-interactive training behaviour:
+          - Frame 0 (anchor): ``is_init_cond_frame=True``, no prompts
+            → triggers the ``no_mem_embed`` path in SAM2Base
+          - Subsequent frames: ``is_init_cond_frame=False``,
+            ``mask_inputs`` = first frame's ``pred_masks_high_res``
+
+        Args:
+            frame_order: list of *original* batch-frame indices (0-based)
+                to process in order.  The first element is the anchor frame.
+            vision_feats / vision_pos_embeds / feat_sizes: pre-computed
+                backbone features for ALL frames in the batch.
+            input: ``BatchedVideoDatapoint`` (used for ``flat_obj_to_img_idx``).
+
+        Returns:
+            List of ``current_out`` dicts (one per frame in ``frame_order``),
+            each containing ``pred_masks``, ``pred_masks_high_res``,
+            ``multistep_pred_ious``, etc.
+        """
+        output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
+        outputs = []
+        first_frame_pred = None
+
+        for local_idx, orig_frame_idx in enumerate(frame_order):
+            is_init = local_idx == 0
+            mask_inputs = None if is_init else first_frame_pred
+
+            img_ids = input.flat_obj_to_img_idx[orig_frame_idx]
+            current_vision_feats = [x[:, img_ids] for x in vision_feats]
+            current_vision_pos_embeds_local = [
+                x[:, img_ids] for x in vision_pos_embeds
+            ]
+
+            current_out = self.track_step(
+                frame_idx=local_idx,
+                is_init_cond_frame=is_init,
+                current_vision_feats=current_vision_feats,
+                current_vision_pos_embeds=current_vision_pos_embeds_local,
+                feat_sizes=feat_sizes,
+                point_inputs=None,
+                mask_inputs=mask_inputs,
+                gt_masks=None,
+                frames_to_add_correction_pt=[],
+                output_dict=output_dict,
+                num_frames=len(frame_order),
+            )
+            outputs.append(current_out)
+
+            if is_init:
+                # Cache for all subsequent frames (matches non-interactive training)
+                first_frame_pred = current_out["pred_masks_high_res"].detach()
+
+            storage_key = "cond_frame_outputs" if is_init else "non_cond_frame_outputs"
+            output_dict[storage_key][local_idx] = current_out
+
+        return outputs
+
+    def forward_tracking_with_fusion(self, backbone_out, input):
+        """Three-path non-interactive fusion forward pass (all frames fused).
+
+        For a batch with ``T = 2*W + 1`` frames (W = ``fusion_window_size``),
+        three independent non-interactive passes are run and their predictions
+        are fused for **every** frame in the sequence:
+
+        1. **Forward**  : frames ``[0, 1, …, T-1]`` (forward order)
+           ``full_outs[i]`` = forward-path prediction for frame i.
+        2. **Backward** : frames ``[T-1, T-2, …, 0]`` (fully reversed)
+           ``bwd_outs[T-1-i]`` = backward-path prediction for frame i.
+        3. **Image**    : each frame alone (no temporal context)
+           ``img_outs[i]`` = image-path prediction for frame i.
+
+        For every frame i, the three predictions are fused with softmax
+        weights derived from their respective ``predict_iou`` scores.
+        All ``multistep_pred_multimasks_high_res`` / ``multistep_pred_ious``
+        fields are replaced so the loss function sees fused results for
+        every frame.
+
+        Backbone features are computed *once* (in ``forward``) and shared
+        across all three paths to avoid redundant backbone calls.
+
+        Returns the same ``list[dict]`` format as ``forward_tracking`` so
+        the existing loss function and trainer need no modification.
+        """
+        num_frames = backbone_out["num_frames"]
+
+        # Shared backbone features (pre-computed in forward())
+        _, vision_feats, vision_pos_embeds, feat_sizes = (
+            self._prepare_backbone_features(backbone_out)
+        )
+
+        # ── Full forward pass: frames [0 … T-1] ──────────────────────────
+        full_outs = self._run_window_non_interactive(
+            frame_order=list(range(num_frames)),
+            vision_feats=vision_feats,
+            vision_pos_embeds=vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            input=input,
+        )
+
+        # ── Full backward pass: frames [T-1, T-2, …, 0] ──────────────────
+        # bwd_outs[T-1-i] is the backward-path prediction for original frame i
+        bwd_outs = self._run_window_non_interactive(
+            frame_order=list(range(num_frames - 1, -1, -1)),
+            vision_feats=vision_feats,
+            vision_pos_embeds=vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            input=input,
+        )
+
+        # ── Image pass: each frame independently (no temporal context) ────
+        img_outs = []
+        for i in range(num_frames):
+            single = self._run_window_non_interactive(
+                frame_order=[i],
+                vision_feats=vision_feats,
+                vision_pos_embeds=vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                input=input,
+            )
+            img_outs.append(single[0])
+
+        # ── IoU-weighted softmax fusion for every frame ───────────────────
+        for i in range(num_frames):
+            fwd_pred = full_outs[i]["pred_masks"]
+            fwd_iou = full_outs[i]["multistep_pred_ious"][0].max(
+                dim=-1, keepdim=True
+            ).values  # [B, 1]
+
+            bwd_pred = bwd_outs[num_frames - 1 - i]["pred_masks"]
+            bwd_iou = bwd_outs[num_frames - 1 - i]["multistep_pred_ious"][0].max(
+                dim=-1, keepdim=True
+            ).values  # [B, 1]
+
+            img_pred = img_outs[i]["pred_masks"]
+            img_iou = img_outs[i]["multistep_pred_ious"][0].max(
+                dim=-1, keepdim=True
+            ).values  # [B, 1]
+
+            ious = torch.cat([fwd_iou, bwd_iou, img_iou], dim=-1)  # [B, 3]
+            weights = torch.softmax(ious, dim=-1)                   # [B, 3]
+            fused_pred = (
+                weights[:, 0:1, None, None] * fwd_pred
+                + weights[:, 1:2, None, None] * bwd_pred
+                + weights[:, 2:3, None, None] * img_pred
+            )
+            fused_pred_high_res = torch.nn.functional.interpolate(
+                fused_pred,
+                scale_factor=4,
+                mode="bilinear",
+                align_corners=False,
+            )
+            fused_iou = (
+                weights[:, 0:1] * fwd_iou
+                + weights[:, 1:2] * bwd_iou
+                + weights[:, 2:3] * img_iou
+            )  # [B, 1] weighted-average IoU
+
+            full_outs[i]["pred_masks"] = fused_pred
+            full_outs[i]["pred_masks_high_res"] = fused_pred_high_res
+            full_outs[i]["multistep_pred_masks"] = fused_pred
+            full_outs[i]["multistep_pred_masks_high_res"] = fused_pred_high_res
+            # These two are what the loss function actually reads:
+            #   multistep_pred_multimasks_high_res → mask / dice loss
+            #   multistep_pred_ious               → IoU loss
+            full_outs[i]["multistep_pred_multimasks_high_res"] = [fused_pred_high_res]
+            full_outs[i]["multistep_pred_multimasks"] = [fused_pred]
+            full_outs[i]["multistep_pred_ious"] = [fused_iou]
+
+        # Remove obj_ptr (keeps DDP / activation-checkpointing happy,
+        # consistent with forward_tracking)
+        return [
+            {k: v for k, v in d.items() if k != "obj_ptr"} for d in full_outs
+        ]
 
     def track_step(
         self,

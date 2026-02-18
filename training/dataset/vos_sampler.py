@@ -85,6 +85,73 @@ class RandomUniformSampler(VOSSampler):
         return SampledFramesAndObjects(frames=frames, object_ids=object_ids)
 
 
+class FusionWindowSampler(VOSSampler):
+    """
+    Sample 2*window_size+1 consecutive frames for tri-path fusion training.
+
+    All three paths share the same frame window:
+      - forward  path : frames[0 … T-1]       (anchor = frames[0])
+      - backward path : frames[T-1 … 0]       (anchor = frames[T-1])
+      - image    path : each frame independently
+
+    Visibility requirement: at least one object must be visible in BOTH
+    frames[0] (forward anchor) AND frames[T-1] (backward anchor).
+    Intermediate frames are allowed to have no visible objects (e.g. occlusion).
+    """
+
+    def __init__(self, num_frames=13, max_num_objects=1, reverse_time_prob=0.0):
+        super().__init__(sort_frames=True)
+        self.num_frames = num_frames
+        self.max_num_objects = max_num_objects
+        self.reverse_time_prob = reverse_time_prob  # kept for API compat, unused
+
+    def _get_visible_ids(self, segment_loader, frame):
+        """Return list of object ids with non-empty masks in the given frame."""
+        loaded = segment_loader.load(frame.frame_idx)
+        if isinstance(loaded, LazySegments):
+            return list(loaded.keys())
+        visible = []
+        for object_id, segment in loaded.items():
+            seg_tensor = segment["segment"] if isinstance(segment, dict) else segment
+            if seg_tensor.sum():
+                visible.append(object_id)
+        return visible
+
+    def sample(self, video, segment_loader, epoch=None):
+        num_video_frames = len(video.frames)
+        if num_video_frames < self.num_frames:
+            raise Exception(
+                f"Cannot sample {self.num_frames} frames from video "
+                f"{video.video_name} as it only has {num_video_frames} "
+                f"annotated frames."
+            )
+
+        for retry in range(MAX_RETRIES):
+            # Sample any valid T-frame window (no centering constraint needed).
+            start = random.randrange(0, num_video_frames - self.num_frames + 1)
+            frames = [video.frames[start + i] for i in range(self.num_frames)]
+
+            # Objects must be visible in BOTH the first frame (forward anchor)
+            # and the last frame (backward anchor).
+            first_visible = set(self._get_visible_ids(segment_loader, frames[0]))
+            last_visible = set(self._get_visible_ids(segment_loader, frames[-1]))
+            both_visible = list(first_visible & last_visible)
+
+            if len(both_visible) > 0:
+                break
+            if retry >= MAX_RETRIES - 1:
+                raise Exception(
+                    f"No objects visible in both first and last frame of "
+                    f"video {video.video_name}"
+                )
+
+        object_ids = random.sample(
+            both_visible,
+            min(len(both_visible), self.max_num_objects),
+        )
+        return SampledFramesAndObjects(frames=frames, object_ids=object_ids)
+
+
 class EvalSampler(VOSSampler):
     """
     VOS Sampler for evaluation: sampling all the frames and all the objects in a video
