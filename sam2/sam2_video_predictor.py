@@ -549,6 +549,7 @@ class SAM2VideoPredictor(SAM2Base):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        return_ious=False,
     ):
         """Propagate the input points across frames to track in the entire video."""
         self.propagate_in_video_preflight(inference_state)
@@ -627,7 +628,21 @@ class SAM2VideoPredictor(SAM2Base):
             _, video_res_masks = self._get_orig_video_res_output(
                 inference_state, all_pred_masks
             )
-            yield frame_idx, obj_ids, video_res_masks
+            if return_ious:
+                frame_ious = []
+                for obj_idx in range(batch_size):
+                    obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                    iou = (
+                        obj_output_dict["non_cond_frame_outputs"]
+                        .get(frame_idx, {})
+                        .get("pred_ious", torch.tensor([0.0]))
+                    )
+                    if iou is None:
+                        iou = torch.tensor([0.0])
+                    frame_ious.append(iou)
+                yield frame_idx, obj_ids, video_res_masks, torch.stack(frame_ious)
+            else:
+                yield frame_idx, obj_ids, video_res_masks
 
     @torch.inference_mode()
     def clear_all_prompts_in_frame(
@@ -792,11 +807,17 @@ class SAM2VideoPredictor(SAM2Base):
         # object pointer is a small tensor, so we always keep it on GPU memory for fast access
         obj_ptr = current_out["obj_ptr"]
         object_score_logits = current_out["object_score_logits"]
+        # extract per-object IoU scores if available (from non-interactive / fusion paths)
+        pred_ious = None
+        if current_out.get("multistep_pred_ious"):
+            pred_ious = current_out["multistep_pred_ious"][0].max(dim=-1).values
+            pred_ious = pred_ious.to(storage_device, non_blocking=True)
         # make a compact version of this frame's output to reduce the state size
         compact_current_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
             "pred_masks": pred_masks,
+            "pred_ious": pred_ious,
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
         }
