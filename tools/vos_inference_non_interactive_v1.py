@@ -1,17 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
+#
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Non-interactive VOS inference script.
 
-Supports two modes:
-  - Standard (default): non-interactive first-frame segmentation via the
-    ``no_mem_embed`` path, then video propagation via ``add_new_mask``.
-  - Fusion (--use_fusion): three-path IoU-weighted softmax fusion aligned
-    with the ``forward_tracking_with_fusion`` training pass.
-"""
 
 import argparse
 import os
@@ -24,7 +17,7 @@ from sam2.build_sam import build_sam2_video_predictor_with_lora
 
 
 # ---------------------------------------------------------------------------
-# DAVIS palette helpers (copied verbatim from vos_inference_with_lora.py)
+# DAVIS palette helpers
 # ---------------------------------------------------------------------------
 
 DAVIS_PALETTE = b"\x00\x00\x00\x80\x00\x00\x00\x80\x00\x80\x80\x00\x00\x00\x80\x80\x00\x80\x00\x80\x80\x80\x80\x80@\x00\x00\xc0\x00\x00@\x80\x00\xc0\x80\x00@\x00\x80\xc0\x00\x80@\x80\x80\xc0\x80\x80\x00@\x00\x80@\x00\x00\xc0\x00\x80\xc0\x00\x00@\x80\x80@\x80\x00\xc0\x80\x80\xc0\x80@@\x00\xc0@\x00@\xc0\x00\xc0\xc0\x00@@\x80\xc0@\x80@\xc0\x80\xc0\xc0\x80\x00\x00@\x80\x00@\x00\x80@\x80\x80@\x00\x00\xc0\x80\x00\xc0\x00\x80\xc0\x80\x80\xc0@\x00@\xc0\x00@@\x80@\xc0\x80@@\x00\xc0\xc0\x00\xc0@\x80\xc0\xc0\x80\xc0\x00@@\x80@@\x00\xc0@\x80\xc0@\x00@\xc0\x80@\xc0\x00\xc0\xc0\x80\xc0\xc0@@@\xc0@@@\xc0@\xc0\xc0@@@\xc0\xc0@\xc0@\xc0\xc0\xc0\xc0\xc0 \x00\x00\xa0\x00\x00 \x80\x00\xa0\x80\x00 \x00\x80\xa0\x00\x80 \x80\x80\xa0\x80\x80`\x00\x00\xe0\x00\x00`\x80\x00\xe0\x80\x00`\x00\x80\xe0\x00\x80`\x80\x80\xe0\x80\x80 @\x00\xa0@\x00 \xc0\x00\xa0\xc0\x00 @\x80\xa0@\x80 \xc0\x80\xa0\xc0\x80`@\x00\xe0@\x00`\xc0\x00\xe0\xc0\x00`@\x80\xe0@\x80`\xc0\x80\xe0\xc0\x80 \x00@\xa0\x00@ \x80@\xa0\x80@ \x00\xc0\xa0\x00\xc0 \x80\xc0\xa0\x80\xc0`\x00@\xe0\x00@`\x80@\xe0\x80@`\x00\xc0\xe0\x00\xc0`\x80\xc0\xe0\x80\xc0 @@\xa0@@ \xc0@\xa0\xc0@ @\xc0\xa0@\xc0 \xc0\xc0\xa0\xc0\xc0`@@\xe0@@`\xc0@\xe0\xc0@`@\xc0\xe0@\xc0`\xc0\xc0\xe0\xc0\xc0\x00 \x00\x80 \x00\x00\xa0\x00\x80\xa0\x00\x00 \x80\x80 \x80\x00\xa0\x80\x80\xa0\x80@ \x00\xc0 \x00@\xa0\x00\xc0\xa0\x00@ \x80\xc0 \x80@\xa0\x80\xc0\xa0\x80\x00`\x00\x80`\x00\x00\xe0\x00\x80\xe0\x00\x00`\x80\x80`\x80\x00\xe0\x80\x80\xe0\x80@`\x00\xc0`\x00@\xe0\x00\xc0\xe0\x00@`\x80\xc0`\x80@\xe0\x80\xc0\xe0\x80\x00 @\x80 @\x00\xa0@\x80\xa0@\x00 \xc0\x80 \xc0\x00\xa0\xc0\x80\xa0\xc0@ @\xc0 @@\xa0@\xc0\xa0@@ \xc0\xc0 \xc0@\xa0\xc0\xc0\xa0\xc0\x00`@\x80`@\x00\xe0@\x80\xe0@\x00`\xc0\x80`\xc0\x00\xe0\xc0\x80\xe0\xc0@`@\xc0`@@\xe0@\xc0\xe0@@`\xc0\xc0`\xc0@\xe0\xc0\xc0\xe0\xc0  \x00\xa0 \x00 \xa0\x00\xa0\xa0\x00  \x80\xa0 \x80 \xa0\x80\xa0\xa0\x80` \x00\xe0 \x00`\xa0\x00\xe0\xa0\x00` \x80\xe0 \x80`\xa0\x80\xe0\xa0\x80 `\x00\xa0`\x00 \xe0\x00\xa0\xe0\x00 `\x80\xa0`\x80 \xe0\x80\xa0\xe0\x80``\x00\xe0`\x00`\xe0\x00\xe0\xe0\x00``\x80\xe0`\x80`\xe0\x80\xe0\xe0\x80  @\xa0 @ \xa0@\xa0\xa0@  \xc0\xa0 \xc0 \xa0\xc0\xa0\xa0\xc0` @\xe0 @`\xa0@\xe0\xa0@` \xc0\xe0 \xc0`\xa0\xc0\xe0\xa0\xc0 `@\xa0`@ \xe0@\xa0\xe0@ `\xc0\xa0`\xc0 \xe0\xc0\xa0\xe0\xc0``@\xe0`@`\xe0@\xe0\xe0@``\xc0\xe0`\xc0`\xe0\xc0\xe0\xe0\xc0"
@@ -107,14 +100,7 @@ def save_masks_to_dir(
 def segment_frame_non_interactive(
     predictor, inference_state, frame_idx=0, score_thresh=0.0
 ):
-    """Run prompt-free segmentation on a single frame via the no_mem_embed path.
-
-    This mirrors the non-interactive first-frame path used during training.
-
-    Returns:
-        binary_mask: bool numpy array of shape [H, W]
-        iou: float tensor of shape [1] (0.5 if the model didn't produce IoU scores)
-    """
+    """Run prompt-free segmentation on a single frame via the no_mem_embed path."""
     video_H = inference_state["video_height"]
     video_W = inference_state["video_width"]
 
@@ -123,20 +109,22 @@ def segment_frame_non_interactive(
         output_dict={"cond_frame_outputs": {}, "non_cond_frame_outputs": {}},
         frame_idx=frame_idx,
         batch_size=1,
-        is_init_cond_frame=True,   # triggers the no_mem_embed path
+        is_init_cond_frame=True,  # triggers the no_mem_embed path
         point_inputs=None,
         mask_inputs=None,
         reverse=False,
         run_mem_encoder=False,
     )
 
-    pred_mask_video_res = F.interpolate(
-        pred_masks_gpu,
+    # Upsample to video resolution (model output is typically 256×256)
+    raw_logit = F.interpolate(
+        pred_masks_gpu.float(),
         size=(video_H, video_W),
         mode="bilinear",
         align_corners=False,
-    )
-    binary_mask = (pred_mask_video_res.squeeze() > score_thresh).cpu().numpy()
+    )  # [1, 1, H, W]  float32, on GPU
+
+    binary_mask = (raw_logit.squeeze() > score_thresh).cpu().numpy()
 
     iou = compact_out.get("pred_ious")
     if iou is None:
@@ -144,7 +132,7 @@ def segment_frame_non_interactive(
     else:
         iou = iou.cpu().float()
 
-    return binary_mask, iou
+    return binary_mask, iou, raw_logit
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +167,7 @@ def vos_non_interactive_inference(
     width = inference_state["video_width"]
 
     # Step 1: segment the first frame without any prompt
-    first_frame_mask, _ = segment_frame_non_interactive(
+    first_frame_mask, _, _ = segment_frame_non_interactive(
         predictor, inference_state, frame_idx=0, score_thresh=score_thresh
     )
 
@@ -217,7 +205,8 @@ def vos_non_interactive_inference(
 
 
 # ---------------------------------------------------------------------------
-# Fusion (three-path) pipeline
+# Fusion (three-path) pipeline v1
+# Backward anchor = last frame directly (no IoU-based search)
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
@@ -230,14 +219,6 @@ def vos_non_interactive_fusion_inference(
     score_thresh=0.0,
     per_obj_png_file=False,
 ):
-    """Three-path IoU-weighted softmax fusion inference.
-
-    Mirrors ``forward_tracking_with_fusion`` from training exactly:
-      1. Forward propagation  (first frame → last frame)
-      2. Backward propagation (last frame  → first frame)
-      3. Per-frame image-level segmentation (no temporal context)
-      4. IoU-weighted softmax fusion of the three logit maps
-    """
     video_dir = os.path.join(base_video_dir, video_name)
     frame_names = sorted(
         [
@@ -255,63 +236,38 @@ def vos_non_interactive_fusion_inference(
     height = inference_state["video_height"]
     width = inference_state["video_width"]
 
-    # ── Step 1: Forward propagation ──────────────────────────────────────
-    fwd_mask_0, _ = segment_frame_non_interactive(
+    # ── Step 1: Forward propagation ──────────────────────────────────────────
+    fwd_mask_0, fwd_iou_0, fwd_raw_logit_0 = segment_frame_non_interactive(
         predictor, inference_state, frame_idx=0, score_thresh=score_thresh
     )
     predictor.add_new_mask(inference_state, 0, 1, fwd_mask_0)
 
-    fwd_results = {}  # frame_idx → (logits [1,1,H,W], iou [1])
+    fwd_results = {}  # frame_idx → (logit [1,1,H,W], iou [1])
     for out_frame_idx, out_obj_ids, out_mask_logits, out_ious in (
         predictor.propagate_in_video(inference_state, return_ious=True)
     ):
-        # out_mask_logits: [num_obj, 1, H, W] at video resolution
-        # out_ious:        [num_obj, 1]
         fwd_results[out_frame_idx] = (
-            out_mask_logits[0:1].clone(),   # [1,1,H,W]
-            out_ious[0].cpu().float(),      # [1]
+            out_mask_logits[0:1].clone(),  # [1,1,H,W] at video resolution
+            out_ious[0].cpu().float(),     # [1]
         )
 
-    # ── Step 2: Backward propagation ─────────────────────────────────────
-    # Scan frames from the end to find a good backward anchor:
-    #   Primary  : foreground exists AND predicted IoU >= bwd_iou_thresh
-    #   Fallback : first frame from the end that has any foreground at all
-    # Using an all-zero anchor causes the entire backward pass to output -1024.
+    fwd_results[0] = (fwd_raw_logit_0, fwd_iou_0)
+
+    # ── Step 2: Backward propagation (v1: anchor = last frame directly) ───────
     predictor.reset_state(inference_state)
-    bwd_iou_thresh = 0.5x       # prefer anchors with IoU >= this value
-    bwd_anchor_frame = None       # IoU-qualified anchor
-    bwd_anchor_mask = None
-    bwd_fallback_frame = None     # first foreground frame from end (any IoU)
-    bwd_fallback_mask = None
-    for scan_idx in range(num_frames - 1, -1, -1):
-        mask_scan, iou_scan = segment_frame_non_interactive(
-            predictor, inference_state, frame_idx=scan_idx, score_thresh=score_thresh
-        )
-        print(iou_scan.item(), scan_idx)
-        if mask_scan.any():
-            if bwd_fallback_frame is None:
-                # record the closest-to-end foreground frame as fallback
-                bwd_fallback_frame = scan_idx
-                bwd_fallback_mask = mask_scan
-            if iou_scan.item() >= bwd_iou_thresh:
-                bwd_anchor_frame = scan_idx
-                bwd_anchor_mask = mask_scan
-                break   # found a high-quality anchor, stop scanning
-    
-    print("#############",bwd_anchor_frame)
 
-    # if no high-IoU anchor found, use the fallback (any foreground frame)
-    if bwd_anchor_frame is None:
-        bwd_anchor_frame = bwd_fallback_frame
-        bwd_anchor_mask = bwd_fallback_mask
+    last_frame_idx = num_frames - 1
+    bwd_mask_last, bwd_iou_last, bwd_raw_logit_last = segment_frame_non_interactive(
+        predictor, inference_state, frame_idx=last_frame_idx, score_thresh=score_thresh
+    )
 
     bwd_results = {}
-    if bwd_anchor_frame is not None:
-        predictor.add_new_mask(inference_state, bwd_anchor_frame, 1, bwd_anchor_mask)
+    if bwd_mask_last.any():
+        predictor.add_new_mask(inference_state, last_frame_idx, 1, bwd_mask_last)
         for out_frame_idx, out_obj_ids, out_mask_logits, out_ious in (
             predictor.propagate_in_video(
                 inference_state,
-                start_frame_idx=bwd_anchor_frame,
+                start_frame_idx=last_frame_idx,
                 reverse=True,
                 return_ious=True,
             )
@@ -320,40 +276,28 @@ def vos_non_interactive_fusion_inference(
                 out_mask_logits[0:1].clone(),
                 out_ious[0].cpu().float(),
             )
-    # If no frame has foreground at all, bwd_results stays empty and fusion
-    # falls back to (zeros, iou=0.0) for all frames via bwd_results.get(...).
 
-    # ── Step 3: Per-frame image-level segmentation ───────────────────────
-    # Reset state so the image cache is intact but no tracking memory pollutes
-    # the image-level (no_mem_embed) path.
+        # Overwrite last frame entry with the raw logit from image-level seg
+        bwd_results[last_frame_idx] = (bwd_raw_logit_last, bwd_iou_last)
+
+    # ── Step 3: Per-frame image-level segmentation ────────────────────────────
     predictor.reset_state(inference_state)
-    img_results = {}  # frame_idx → (bool mask [H,W], iou [1])
+    img_results = {}  # frame_idx → (raw_logit [1,1,H,W], iou [1])
     for i in range(num_frames):
-        img_mask, img_iou = segment_frame_non_interactive(
+        _, img_iou, img_raw_logit = segment_frame_non_interactive(
             predictor, inference_state, frame_idx=i, score_thresh=score_thresh
         )
-        img_results[i] = (img_mask, img_iou)
+        img_results[i] = (img_raw_logit, img_iou)
 
-    # ── Step 4: IoU-weighted softmax fusion ──────────────────────────────
+    # ── Step 4: IoU-weighted softmax fusion ───────────────────────────────────
     os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
+    zeros = torch.zeros(1, 1, height, width)
 
     for i in range(num_frames):
-        fwd_logit, fwd_iou = fwd_results.get(
-            i, (torch.zeros(1, 1, height, width), torch.tensor([0.0]))
-        )
-        bwd_logit, bwd_iou = bwd_results.get(
-            i, (torch.zeros(1, 1, height, width), torch.tensor([0.0]))
-        )
-        img_mask_np, img_iou = img_results[i]
+        fwd_logit, fwd_iou = fwd_results.get(i, (zeros, torch.tensor([0.0])))
+        bwd_logit, bwd_iou = bwd_results.get(i, (zeros, torch.tensor([0.0])))
+        img_logit, img_iou = img_results[i]
 
-        # Convert boolean image mask to a logit map
-        img_logit = (
-            torch.tensor(img_mask_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            * 20.0
-            - 10.0
-        )  # False→-10, True→+10
-
-        # Move all logits to the same device for fusion
         device = fwd_logit.device
         bwd_logit = bwd_logit.to(device)
         img_logit = img_logit.to(device)
@@ -362,9 +306,9 @@ def vos_non_interactive_fusion_inference(
         weights = torch.softmax(ious.float(), dim=0)               # [3]
 
         fused = (
-            weights[0] * fwd_logit
-            + weights[1] * bwd_logit
-            + weights[2] * img_logit
+            weights[0] * fwd_logit.float()
+            + weights[1] * bwd_logit.float()
+            + weights[2] * img_logit.float()
         )  # [1,1,H,W]
 
         binary = (fused.squeeze() > score_thresh).cpu().numpy()
@@ -388,71 +332,19 @@ def vos_non_interactive_fusion_inference(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Non-interactive VOS inference (no GT mask required)"
+        description="Non-interactive VOS inference v1 (last-frame backward anchor)"
     )
-    parser.add_argument(
-        "--sam2_cfg",
-        type=str,
-        required=True,
-        help="SAM 2 model configuration file",
-    )
-    parser.add_argument(
-        "--sam2_checkpoint",
-        type=str,
-        required=True,
-        help="path to the SAM 2 model checkpoint (may include LoRA weights)",
-    )
-    parser.add_argument(
-        "--base_video_dir",
-        type=str,
-        required=True,
-        help="directory containing video subdirectories (JPEG frames)",
-    )
-    parser.add_argument(
-        "--output_mask_dir",
-        type=str,
-        required=True,
-        help="directory to save the output masks (PNG files)",
-    )
-    parser.add_argument(
-        "--video_list_file",
-        type=str,
-        default=None,
-        help="text file listing video names to process (default: all subdirs)",
-    )
-    parser.add_argument(
-        "--score_thresh",
-        type=float,
-        default=0.0,
-        help="threshold for mask logits (default: 0.0)",
-    )
-    parser.add_argument(
-        "--per_obj_png_file",
-        action="store_true",
-        help="save each object as a separate PNG file (SA-V style)",
-    )
-    parser.add_argument(
-        "--apply_postprocessing",
-        action="store_true",
-        help="apply post-processing (e.g. hole-filling) to output masks",
-    )
-    parser.add_argument(
-        "--use_fusion",
-        action="store_true",
-        help="enable three-path IoU-weighted softmax fusion inference",
-    )
-    parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=8,
-        help="LoRA rank (default: 8)",
-    )
-    parser.add_argument(
-        "--lora_dropout",
-        type=float,
-        default=0.1,
-        help="LoRA dropout (default: 0.1)",
-    )
+    parser.add_argument("--sam2_cfg", type=str, required=True)
+    parser.add_argument("--sam2_checkpoint", type=str, required=True)
+    parser.add_argument("--base_video_dir", type=str, required=True)
+    parser.add_argument("--output_mask_dir", type=str, required=True)
+    parser.add_argument("--video_list_file", type=str, default=None)
+    parser.add_argument("--score_thresh", type=float, default=0.0)
+    parser.add_argument("--per_obj_png_file", action="store_true")
+    parser.add_argument("--apply_postprocessing", action="store_true")
+    parser.add_argument("--use_fusion", action="store_true")
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
     args = parser.parse_args()
 
     hydra_overrides_extra = [
@@ -479,9 +371,9 @@ def main():
             if os.path.isdir(os.path.join(args.base_video_dir, p))
         )
 
-    mode = "fusion" if args.use_fusion else "standard"
+    mode = "fusion (v1)" if args.use_fusion else "standard"
     print(
-        f"Running non-interactive VOS inference ({mode} mode) "
+        f"Running non-interactive VOS inference ({mode}) "
         f"on {len(video_names)} video(s)."
     )
 
@@ -506,9 +398,7 @@ def main():
                 per_obj_png_file=args.per_obj_png_file,
             )
 
-    print(
-        f"\nDone. Output masks saved to {args.output_mask_dir}"
-    )
+    print(f"\nDone. Output masks saved to {args.output_mask_dir}")
 
 
 if __name__ == "__main__":

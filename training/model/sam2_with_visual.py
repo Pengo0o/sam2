@@ -67,15 +67,22 @@ class SAM2Train(SAM2Base):
         # of all frames at once. This avoids backbone OOM errors on very long videos in evaluation, but could be slightly slower.
         forward_backbone_per_frame_for_eval=False,
         freeze_image_encoder=False,
+        freeze_memory_attention=False,
+        freeze_memory_encoder=False,
+        freeze_prompt_encoder=False,
         # Visualization parameters
         visualize_interval=100,  # Visualize every N iterations
         visualize_dir="visualization_output",  # Directory to save visualizations
         # Non-interactive mode: no prompts for images, first-frame prediction as prompt for videos
         non_interactive_mode=False,
-        # Fusion training: tri-path (forward / backward / image) fusion at the target frame.
+        # Fusion training: dual-path (forward video / image) fusion with separate supervision.
         # Requires the data sampler to provide 2*fusion_window_size+1 frames centered on target.
         fusion_training=False,
         fusion_window_size=6,
+        # Whether to detach video predictions when computing the fusion step.
+        # True  → fusion loss only backprops through the image path (video training unaffected).
+        # False → fusion loss backprops through both video and image paths.
+        fusion_detach_video=True,
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
@@ -96,6 +103,7 @@ class SAM2Train(SAM2Base):
         # Fusion training setting
         self.fusion_training = fusion_training
         self.fusion_window_size = fusion_window_size
+        self.fusion_detach_video = fusion_detach_video
 
         # Point sampler and conditioning frames
         self.prob_to_use_pt_input_for_train = prob_to_use_pt_input_for_train
@@ -127,6 +135,15 @@ class SAM2Train(SAM2Base):
 
         if freeze_image_encoder:
             for p in self.image_encoder.parameters():
+                p.requires_grad = False
+        if freeze_memory_attention and self.memory_attention is not None:
+            for p in self.memory_attention.parameters():
+                p.requires_grad = False
+        if freeze_memory_encoder and self.memory_encoder is not None:
+            for p in self.memory_encoder.parameters():
+                p.requires_grad = False
+        if freeze_prompt_encoder:
+            for p in self.sam_prompt_encoder.parameters():
                 p.requires_grad = False
 
     def forward(self, input: BatchedVideoDatapoint):
@@ -490,58 +507,32 @@ class SAM2Train(SAM2Base):
         return outputs
 
     def forward_tracking_with_fusion(self, backbone_out, input):
-        """Three-path non-interactive fusion forward pass (all frames fused).
+        """Dual-path fusion: video forward tracking + per-frame image inference.
 
-        For a batch with ``T = 2*W + 1`` frames (W = ``fusion_window_size``),
-        three independent non-interactive passes are run and their predictions
-        are fused for **every** frame in the sequence:
+        Three separate supervisions share the same loss configuration:
+          step 0 (existing): video forward tracking prediction
+          step 1 (new):      per-frame image-only prediction
+          step 2 (new):      IoU-weighted fusion of video + image predictions
 
-        1. **Forward**  : frames ``[0, 1, …, T-1]`` (forward order)
-           ``full_outs[i]`` = forward-path prediction for frame i.
-        2. **Backward** : frames ``[T-1, T-2, …, 0]`` (fully reversed)
-           ``bwd_outs[T-1-i]`` = backward-path prediction for frame i.
-        3. **Image**    : each frame alone (no temporal context)
-           ``img_outs[i]`` = image-path prediction for frame i.
+        Whether the video prediction is detached before fusion is controlled
+        by ``self.fusion_detach_video`` (set via the YAML ``fusion_detach_video``
+        parameter):
+          True  → fusion loss only backprops through the image path.
+          False → fusion loss backprops through both video and image paths.
 
-        For every frame i, the three predictions are fused with softmax
-        weights derived from their respective ``predict_iou`` scores.
-        All ``multistep_pred_multimasks_high_res`` / ``multistep_pred_ious``
-        fields are replaced so the loss function sees fused results for
-        every frame.
-
-        Backbone features are computed *once* (in ``forward``) and shared
-        across all three paths to avoid redundant backbone calls.
-
-        Returns the same ``list[dict]`` format as ``forward_tracking`` so
-        the existing loss function and trainer need no modification.
+        Backbone features are computed once (in ``forward``) and shared
+        across all paths to avoid redundant backbone calls.
         """
-        num_frames = backbone_out["num_frames"]
+        # ── Step 1: original video forward tracking ───────────────────────
+        video_outs = self.forward_tracking(backbone_out, input)
 
-        # Shared backbone features (pre-computed in forward())
+        # ── Shared backbone features (pre-computed in forward()) ──────────
         _, vision_feats, vision_pos_embeds, feat_sizes = (
             self._prepare_backbone_features(backbone_out)
         )
+        num_frames = backbone_out["num_frames"]
 
-        # ── Full forward pass: frames [0 … T-1] ──────────────────────────
-        full_outs = self._run_window_non_interactive(
-            frame_order=list(range(num_frames)),
-            vision_feats=vision_feats,
-            vision_pos_embeds=vision_pos_embeds,
-            feat_sizes=feat_sizes,
-            input=input,
-        )
-
-        # ── Full backward pass: frames [T-1, T-2, …, 0] ──────────────────
-        # bwd_outs[T-1-i] is the backward-path prediction for original frame i
-        bwd_outs = self._run_window_non_interactive(
-            frame_order=list(range(num_frames - 1, -1, -1)),
-            vision_feats=vision_feats,
-            vision_pos_embeds=vision_pos_embeds,
-            feat_sizes=feat_sizes,
-            input=input,
-        )
-
-        # ── Image pass: each frame independently (no temporal context) ────
+        # ── Step 2: per-frame image inference (no temporal context) ───────
         img_outs = []
         for i in range(num_frames):
             single = self._run_window_non_interactive(
@@ -553,58 +544,66 @@ class SAM2Train(SAM2Base):
             )
             img_outs.append(single[0])
 
-        # ── IoU-weighted softmax fusion for every frame ───────────────────
+        # ── Step 3: append image and fusion steps to each frame's multistep lists ──
         for i in range(num_frames):
-            fwd_pred = full_outs[i]["pred_masks"]
-            fwd_iou = full_outs[i]["multistep_pred_ious"][0].max(
-                dim=-1, keepdim=True
-            ).values  # [B, 1]
+            # Image path (single step)
+            img_pred_high = img_outs[i]["multistep_pred_multimasks_high_res"][0]
+            img_pred_low  = img_outs[i]["multistep_pred_multimasks"][0]
+            img_iou       = img_outs[i]["multistep_pred_ious"][0]
+            img_obj       = img_outs[i]["multistep_object_score_logits"][0]
 
-            bwd_pred = bwd_outs[num_frames - 1 - i]["pred_masks"]
-            bwd_iou = bwd_outs[num_frames - 1 - i]["multistep_pred_ious"][0].max(
-                dim=-1, keepdim=True
-            ).values  # [B, 1]
+            # Video path (last step from forward_tracking)
+            vid_pred_high = video_outs[i]["multistep_pred_multimasks_high_res"][-1]
+            vid_pred_low  = video_outs[i]["multistep_pred_multimasks"][-1]
+            vid_iou       = video_outs[i]["multistep_pred_ious"][-1]
+            vid_obj       = video_outs[i]["multistep_object_score_logits"][-1]
 
-            img_pred = img_outs[i]["pred_masks"]
-            img_iou = img_outs[i]["multistep_pred_ious"][0].max(
-                dim=-1, keepdim=True
-            ).values  # [B, 1]
+            # IoU-weighted softmax fusion weights derived from per-path best IoU  [B, 2]
+            w_v = vid_iou.max(dim=-1, keepdim=True).values  # [B, 1]
+            w_i = img_iou.max(dim=-1, keepdim=True).values  # [B, 1]
+            weights = torch.softmax(torch.cat([w_v, w_i], dim=-1), dim=-1)
 
-            ious = torch.cat([fwd_iou, bwd_iou, img_iou], dim=-1)  # [B, 3]
-            weights = torch.softmax(ious, dim=-1)                   # [B, 3]
-            fused_pred = (
-                weights[:, 0:1, None, None] * fwd_pred
-                + weights[:, 1:2, None, None] * bwd_pred
-                + weights[:, 2:3, None, None] * img_pred
+            # Optionally detach video predictions so fusion loss does not
+            # backprop into the video path.
+            vid_high_for_fuse = (
+                vid_pred_high.detach() if self.fusion_detach_video else vid_pred_high
             )
-            fused_pred_high_res = torch.nn.functional.interpolate(
-                fused_pred,
-                scale_factor=4,
-                mode="bilinear",
-                align_corners=False,
+            vid_low_for_fuse = (
+                vid_pred_low.detach() if self.fusion_detach_video else vid_pred_low
             )
-            fused_iou = (
-                weights[:, 0:1] * fwd_iou
-                + weights[:, 1:2] * bwd_iou
-                + weights[:, 2:3] * img_iou
-            )  # [B, 1] weighted-average IoU
+            vid_iou_for_fuse = (
+                vid_iou.detach() if self.fusion_detach_video else vid_iou
+            )
+            vid_obj_for_fuse = (
+                vid_obj.detach() if self.fusion_detach_video else vid_obj
+            )
 
-            full_outs[i]["pred_masks"] = fused_pred
-            full_outs[i]["pred_masks_high_res"] = fused_pred_high_res
-            full_outs[i]["multistep_pred_masks"] = fused_pred
-            full_outs[i]["multistep_pred_masks_high_res"] = fused_pred_high_res
-            # These two are what the loss function actually reads:
-            #   multistep_pred_multimasks_high_res → mask / dice loss
-            #   multistep_pred_ious               → IoU loss
-            full_outs[i]["multistep_pred_multimasks_high_res"] = [fused_pred_high_res]
-            full_outs[i]["multistep_pred_multimasks"] = [fused_pred]
-            full_outs[i]["multistep_pred_ious"] = [fused_iou]
+            fused_pred_high = (
+                weights[:, 0:1, None, None] * vid_high_for_fuse
+                + weights[:, 1:2, None, None] * img_pred_high
+            )
+            fused_pred_low = (
+                weights[:, 0:1, None, None] * vid_low_for_fuse
+                + weights[:, 1:2, None, None] * img_pred_low
+            )
+            # Detach fused_iou: it is a derived quantity (not a direct network output),
+            # so supervising it against actual IoU has no clear semantic meaning.
+            # mask/dice loss handles fusion supervision; IoU heads are trained by video/image steps.
+            fused_iou = (weights[:, 0:1] * vid_iou_for_fuse + weights[:, 1:2] * img_iou).detach()
 
-        # Remove obj_ptr (keeps DDP / activation-checkpointing happy,
-        # consistent with forward_tracking)
-        return [
-            {k: v for k, v in d.items() if k != "obj_ptr"} for d in full_outs
-        ]
+            # Append image step
+            video_outs[i]["multistep_pred_multimasks_high_res"].append(img_pred_high)
+            video_outs[i]["multistep_pred_multimasks"].append(img_pred_low)
+            video_outs[i]["multistep_pred_ious"].append(img_iou)
+            video_outs[i]["multistep_object_score_logits"].append(img_obj)
+
+            # Append fusion step
+            video_outs[i]["multistep_pred_multimasks_high_res"].append(fused_pred_high)
+            video_outs[i]["multistep_pred_multimasks"].append(fused_pred_low)
+            video_outs[i]["multistep_pred_ious"].append(fused_iou)
+            video_outs[i]["multistep_object_score_logits"].append(vid_obj_for_fuse)
+
+        return video_outs
 
     def track_step(
         self,

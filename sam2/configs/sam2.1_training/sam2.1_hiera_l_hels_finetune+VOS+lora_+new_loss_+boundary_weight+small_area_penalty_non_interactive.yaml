@@ -4,12 +4,12 @@ scratch:
   resolution: 1024
   train_batch_size: 1
   num_train_workers: 10
-  num_frames: 3
+  num_frames: 7
   max_num_objects: 3
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 400
+  num_epochs: 200
 
 dataset:
   # PATHS to Dataset
@@ -72,7 +72,7 @@ trainer:
   # max_epochs: 40
   accelerator: cuda
   seed_value: 123
-  lora_rank: 8 # add lora
+  lora_rank: null
 
   model:
     _target_: training.model.sam2_with_visual.SAM2Train
@@ -238,38 +238,38 @@ trainer:
       _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
       phases_per_epoch: ${scratch.phases_per_epoch} # Chunks a single epoch into smaller phases
       batch_sizes: # List of batch sizes corresponding to each dataset
-      - 3 # Batch size of dataset 1 (CVPR2027 image)
-      - 1 # Batch size of dataset 2 (CVPR2027 video - VOS)
+      - 12 # Batch size of dataset 1 (CVPR2027 image)
+      - 2 # Batch size of dataset 2 (CVPR2027 video - VOS)
       datasets:
 
       # Hels Image Segmentation，  a datase of bone images
       - _target_: training.dataset.utils.RepeatFactorWrapper
         dataset:
           _target_: training.dataset.vos_dataset.VOSDataset
-          multiplier: 0.15
+          multiplier: 0.5
           training: true
           video_dataset:
             _target_: training.dataset.vos_raw_dataset.BoneRawDataset
-            img_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2029/imgs/imgs # PATH to bone images
-            gt_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2029/imgs/ground_truth # PATH to bone annotations
-            weight_map_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2029/imgs/weight_maps # PATH to weight maps for small area penalty
+            img_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/imgs/imgs # PATH to bone images
+            gt_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/imgs/ground_truth # PATH to bone annotations
+            weight_map_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/imgs/weight_maps # PATH to weight maps for small area penalty
             file_list_txt: training/assets/HELS_train_final.txt # Optional
           sampler:
             _target_: training.dataset.vos_sampler.RandomUniformSampler
             num_frames: 1
             max_num_objects: ${scratch.max_num_objects}
           transforms: ${vos.train_transforms}
-      # CVPR2029 Video Dataset - VOS format with video sequences
+      # CVPR2028 Video Dataset - VOS format with video sequences
       - _target_: training.dataset.utils.RepeatFactorWrapper
         dataset:
           _target_: training.dataset.vos_dataset.VOSDataset
-          multiplier: 86
+          multiplier: 70
           training: true
           video_dataset:
             _target_: training.dataset.vos_raw_dataset.PNGRawDatasetWithWeightMap
-            img_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2029/video/JPEGImages # PATH to video images
-            gt_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2029/video/Annotations # PATH to video annotations
-            weight_map_folder: /opt/data/private/lls/HLES-SAM/data/CVPR2029/video/WeightMaps  # PATH to weight maps for small area penalty
+            img_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/video/JPEGImages # PATH to video images
+            gt_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/video/Annotations # PATH to video annotations
+            weight_map_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/video/WeightMaps  # PATH to weight maps for small area penalty
             file_list_txt: null
             is_palette: false  
             single_object_mode: false
@@ -291,10 +291,6 @@ trainer:
       - _target_: training.utils.data_utils.collate_fn
         _partial_: true
         dict_key: bone_video  # DIS5KRawDataset uses "dis5k" key
-      # collate_fn:
-      #   _target_: training.utils.data_utils.collate_fn
-      #   _partial_: true
-      #   dict_key: all
       
 
   optim:

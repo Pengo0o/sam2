@@ -166,7 +166,7 @@ class Trainer:
         optim_overrides: Optional[List[Dict[str, Any]]] = None,
         meters: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
-        lora_rank: Optional[int] = 8,
+        lora_rank: Optional[int] = None,
     ):
 
         self._setup_env_variables(env_variables)

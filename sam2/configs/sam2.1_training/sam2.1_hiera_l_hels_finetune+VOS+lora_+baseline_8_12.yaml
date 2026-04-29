@@ -4,20 +4,21 @@ scratch:
   resolution: 1024
   train_batch_size: 1
   num_train_workers: 10
-  num_frames: 7              
-  max_num_objects: 3         
+  num_frames: 7
+  max_num_objects: 3
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 200
+  num_epochs: 120
 
 dataset:
-  img_folder: null
-  gt_folder: null
-  file_list_txt: null
+  # PATHS to Dataset
+  img_folder: null # PATH to MOSE JPEGImages folder
+  gt_folder: null  # PATH to MOSE Annotations folder
+  file_list_txt: null # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 2
 
-# Video transforms (identical to base config)
+# Video transforms
 vos:
   train_transforms:
     - _target_: training.dataset.transforms.ComposeAPI
@@ -66,11 +67,12 @@ vos:
 
 trainer:
   _target_: training.trainer.Trainer
-  mode: train_only
+  mode: train_only # train and val
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  # max_epochs: 40
   accelerator: cuda
   seed_value: 123
-  lora_rank: null
+  lora_rank: 8 # add lora
 
   model:
     _target_: training.model.sam2_with_visual.SAM2Train
@@ -96,7 +98,7 @@ trainer:
           temperature: 10000
         d_model: 256
         backbone_channel_list: [1152, 576, 288, 144]
-        fpn_top_down_levels: [2, 3]
+        fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
         fpn_interp_model: nearest
 
     memory_attention:
@@ -154,105 +156,128 @@ trainer:
             kernel_size: 7
             padding: 3
             layer_scale_init_value: 1e-6
-            use_dwconv: True
+            use_dwconv: True  # depth-wise convs
           num_layers: 2
+
 
     num_maskmem: 7
     image_size: ${scratch.resolution}
+    # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
     sigmoid_scale_for_mem_enc: 20.0
     sigmoid_bias_for_mem_enc: -10.0
     use_mask_input_as_output_without_sam: false
+    # Memory
     directly_add_no_mem_embed: true
     no_obj_embed_spatial: true
+    # use high-resolution feature map in the SAM mask decoder
     use_high_res_features_in_sam: true
+    # output 3 masks on the first click on initial conditioning frames
     multimask_output_in_sam: true
+    # SAM heads
     iou_prediction_use_sigmoid: True
+    # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
     use_obj_ptrs_in_encoder: true
     add_tpos_enc_to_obj_ptrs: true
     proj_tpos_enc_in_obj_ptrs: true
     use_signed_tpos_enc_to_obj_ptrs: true
     only_obj_ptrs_in_the_past_for_eval: true
+    # object occlusion prediction
     pred_obj_scores: true
     pred_obj_scores_mlp: true
     fixed_no_obj_ptr: true
+    # multimask tracking settings
     multimask_output_for_tracking: true
     use_multimask_token_for_obj_ptr: true
     multimask_min_pt_num: 0
     multimask_max_pt_num: 1
     use_mlp_for_obj_ptr_proj: true
+    # Compilation flag
+    # compile_image_encoder: False
 
-    # Non-interactive mode (base requirement for fusion)
+    # Enable non-interactive training mode
     non_interactive_mode: true
 
-    # Fusion training: enabled
-    fusion_training: true
+    fusion_training: false
 
-    # No interactive prompts
+    # These parameters are effectively unused in non-interactive mode
+    # but we set them to 0 for clarity
     prob_to_use_pt_input_for_train: 0.0
     prob_to_use_box_input_for_train: 0.0
     num_frames_to_correct_for_train: 0
     num_frames_to_correct_for_eval: 0
     num_correction_pt_per_frame: 0
-    num_init_cond_frames_for_train: 1 
+    num_init_cond_frames_for_train: 1  
     rand_init_cond_frames_for_train: false
 
+    ####### Training specific params #######
+    # box/point input and corrections
+    # prob_to_use_pt_input_for_train: 0.5
+    # prob_to_use_pt_input_for_train: 1
     prob_to_use_pt_input_for_eval: 0.0
+    # prob_to_use_box_input_for_train: 0.5
+    # prob_to_use_box_input_for_train: 1  # 0.5*0.5 = 0.25 prob to use box instead of points
     prob_to_use_box_input_for_eval: 0.0
-    prob_to_sample_from_gt_for_train: 0.1
-    rand_frames_to_correct_for_train: True
-    add_all_frames_to_correct_as_cond: True
+    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    # num_frames_to_correct_for_train: 2  # iteratively sample on random 1~2 frames (always include the first frame)
+    # num_frames_to_correct_for_eval: 1  # only iteratively sample on first frame
+    rand_frames_to_correct_for_train: True  # random #init-cond-frame ~ 2
+    add_all_frames_to_correct_as_cond: True  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
+    # maximum 2 initial conditioning frames
+    # num_init_cond_frames_for_train: 1
+    # rand_init_cond_frames_for_train: True  # random 1~2
+    # num_correction_pt_per_frame: 7
     use_act_ckpt_iterative_pt_sampling: false
 
-    num_init_cond_frames_for_eval: 1
+    num_init_cond_frames_for_eval: 1  # only mask on the first frame
     forward_backbone_per_frame_for_eval: True
+    # visualization
     visualize_dir: ${launcher.experiment_log_dir}/visualizations
     visualize_interval: 100
-
+    
 
   data:
     train:
       _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
-      phases_per_epoch: ${scratch.phases_per_epoch}
-      batch_sizes:
-      - 12  # Bone image dataset (single-frame, unchanged)
-      - 1  # Video dataset with FusionWindowSampler
+      phases_per_epoch: ${scratch.phases_per_epoch} # Chunks a single epoch into smaller phases
+      batch_sizes: # List of batch sizes corresponding to each dataset
+      - 12 # Batch size of dataset 1 (CVPR2027 image)
+      - 2 # Batch size of dataset 2 (CVPR2027 video - VOS)
       datasets:
 
-      # Bone image dataset (single-frame, sampler unchanged)
+      # Hels Image Segmentation，  a datase of bone images
       - _target_: training.dataset.utils.RepeatFactorWrapper
         dataset:
           _target_: training.dataset.vos_dataset.VOSDataset
-          multiplier: 0.5
+          multiplier: 0.7
           training: true
           video_dataset:
             _target_: training.dataset.vos_raw_dataset.BoneRawDataset
-            img_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/imgs/imgs # PATH to bone images
-            gt_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/imgs/ground_truth # PATH to bone annotations
-            weight_map_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/imgs/weight_maps # PATH to weight maps for small area penalty
-            file_list_txt: training/assets/HELS_train_final.txt # Optional
+            img_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029_aug8/imgs/imgs # PATH to bone images
+            gt_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029_aug8/imgs/ground_truth # PATH to bone annotations
+            weight_map_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029_aug8/imgs/weight_maps # PATH to weight maps for small area penalty
+            file_list_txt: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029_aug8/imgs/HELS_train.txt # Optional
           sampler:
             _target_: training.dataset.vos_sampler.RandomUniformSampler
             num_frames: 1
             max_num_objects: ${scratch.max_num_objects}
           transforms: ${vos.train_transforms}
-
-      # Video dataset – uses FusionWindowSampler to provide 13-frame windows
+      # CVPR2028 Video Dataset - VOS format with video sequences
       - _target_: training.dataset.utils.RepeatFactorWrapper
         dataset:
           _target_: training.dataset.vos_dataset.VOSDataset
-          multiplier: 70
+          multiplier: 200
           training: true
           video_dataset:
             _target_: training.dataset.vos_raw_dataset.PNGRawDatasetWithWeightMap
-            img_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/video/JPEGImages # PATH to video images
-            gt_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/video/Annotations # PATH to video annotations
-            weight_map_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029/video/WeightMaps  # PATH to weight maps for small area penalty
+            img_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029_aug8/video/JPEGImages # PATH to video images
+            gt_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029_aug8/video/Annotations # PATH to video annotations
+            weight_map_folder: /root/workspace/d663ovsp420c73cg8l00/data/CVPR2029_aug8/video/WeightMaps  # PATH to weight maps for small area penalty
             file_list_txt: null
-            is_palette: false
+            is_palette: false  
             single_object_mode: false
-            sample_rate: 1
+            sample_rate: 1  
           sampler:
-            _target_: training.dataset.vos_sampler.FusionWindowSampler
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
             num_frames: ${scratch.num_frames}
             max_num_objects: ${scratch.max_num_objects}
           transforms: ${vos.train_transforms}
@@ -264,11 +289,11 @@ trainer:
       collate_fns:
       - _target_: training.utils.data_utils.collate_fn
         _partial_: true
-        dict_key: bone
+        dict_key: bone  # BoneRawDataset uses "bone" key
       - _target_: training.utils.data_utils.collate_fn
         _partial_: true
-        dict_key: bone_video
-
+        dict_key: bone_video  # DIS5KRawDataset uses "dis5k" key
+      
 
   optim:
     amp:
@@ -328,12 +353,13 @@ trainer:
       pred_obj_scores: true
       focal_gamma_obj_score: 0.0
       focal_alpha_obj_score: -1.0
-      ignore_edge_loss: true
-      edge_width: 3
-      focal_edge_smallarea_weight: 10.0
-      focal_edge_weight: 0.0
-      dice_edge_weight: 0.0
+      ignore_edge_loss: true    
+      edge_width: 0
+      focal_edge_smallarea_weight: 1.0
+      focal_edge_weight: null
+      dice_edge_weight: null
     bone_video: *loss_cfg
+    # val: *loss_cfg
 
   distributed:
     backend: nccl
@@ -348,25 +374,28 @@ trainer:
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
 
+  # initialize from a SAM 2 checkpoint
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 10
+    save_freq: 10 # 0 only last checkpoint is saved.
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
       strict: True
       ignore_unexpected_keys: null
       ignore_missing_keys: null
+
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
-        checkpoint_path: ./checkpoints/sam2.1_hiera_large.pt
+        checkpoint_path: ./checkpoints/sam2.1_hiera_large.pt # PATH to SAM 2.1 checkpoint
         ckpt_state_dict_keys: ['model']
 
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: output_0218_sam2.1_hiera_l_hels_finetune+VOS+lora_+new_loss_+boundary_weight+small_area_penalty_non_interactive_fusion # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: output_0222_sam2.1_hiera_l_hels_finetune+VOS+lora_+baseline_8_12 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
+# SLURM args if running on a cluster
 submitit:
   partition: null
   account: null
